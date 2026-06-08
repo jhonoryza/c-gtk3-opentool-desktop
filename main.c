@@ -19,10 +19,14 @@
 
 #define MAX_CONFIGS 7
 
+/* ────────────────────────────────────────────────────────────────────────
+ *  Data
+ * ──────────────────────────────────────────────────────────────────────── */
+
 typedef struct {
     const char *name;
-    const char *path_template;   /* ~ will be expanded; NULL = use dynamic user path */
-    int         use_dynamic_user; /* 1 = build path using $USER */
+    const char *path_template;    /* ~ → $HOME ; NULL = dynamic via $USER */
+    int         use_dynamic_user;
 } ConfigItem;
 
 static const ConfigItem configs[MAX_CONFIGS] = {
@@ -36,13 +40,110 @@ static const ConfigItem configs[MAX_CONFIGS] = {
 };
 
 /* ────────────────────────────────────────────────────────────────────────
+ *  CSS Stylesheet
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static const char *APP_CSS =
+    /* ── Root window ── */
+    "window {"
+    "  background-color: #f5f5f7;"
+    "}"
+
+    /* ── Header ── */
+    ".header-box {"
+    "  background-color: #ffffff;"
+    "  border-bottom: 1px solid #d2d2d7;"
+    "  padding: 12px 16px;"
+    "}"
+    ".title-label {"
+    "  font-size: 15px;"
+    "  font-weight: bold;"
+    "  color: #1d1d1f;"
+    "}"
+    ".subtitle-label {"
+    "  font-size: 11px;"
+    "  color: #86868b;"
+    "  margin-top: 2px;"
+    "}"
+
+    /* ── List box ── */
+    "list {"
+    "  background-color: #ffffff;"
+    "}"
+
+    /* ── List rows ── */
+    "list row {"
+    "  background-color: #ffffff;"
+    "  border-bottom: 1px solid #f0f0f2;"
+    "  padding: 0;"
+    "}"
+    "list row:nth-child(even) {"
+    "  background-color: #fafafc;"
+    "}"
+    "list row:hover {"
+    "  background-color: #e8f0fe;"
+    "  transition: background-color 150ms ease;"
+    "}"
+
+    /* ── Config name label ── */
+    ".config-name {"
+    "  font-size: 13px;"
+    "  color: #1d1d1f;"
+    "  padding: 8px 4px 8px 16px;"
+    "}"
+
+    /* ── Open button ── */
+    ".open-button {"
+    "  background-image: linear-gradient(to bottom, #007aff, #0062cc);"
+    "  color: #ffffff;"
+    "  border: none;"
+    "  border-radius: 5px;"
+    "  padding: 5px 14px;"
+    "  font-size: 12px;"
+    "  font-weight: 500;"
+    "  margin: 4px 16px 4px 4px;"
+    "}"
+    ".open-button:hover {"
+    "  background-image: linear-gradient(to bottom, #0062cc, #0055b3);"
+    "}"
+    ".open-button:active {"
+    "  background-image: linear-gradient(to bottom, #0055b3, #004499);"
+    "}"
+
+    /* ── Status bar ── */
+    ".status-bar {"
+    "  font-size: 11px;"
+    "  color: #86868b;"
+    "  background-color: #ffffff;"
+    "  border-top: 1px solid #d2d2d7;"
+    "  padding: 5px 16px;"
+    "}"
+
+    /* ── Scrollbar ── */
+    "scrollbar {"
+    "  background-color: transparent;"
+    "  border: none;"
+    "}"
+    "scrollbar slider {"
+    "  background-color: rgba(0,0,0,0.16);"
+    "  border-radius: 4px;"
+    "  min-width: 6px;"
+    "}"
+    "scrollbar slider:hover {"
+    "  background-color: rgba(0,0,0,0.28);"
+    "}"
+
+    /* ── Scrolled window ── */
+    "scrolledwindow undershoot,"
+    "scrolledwindow overshoot {"
+    "  background-color: transparent;"
+    "}"
+    ;
+
+/* ────────────────────────────────────────────────────────────────────────
  *  Path helpers
  * ──────────────────────────────────────────────────────────────────────── */
 
-/**
- * Expand a path: replace a leading ~ with the user's home directory.
- * Returns a newly allocated string that the caller must free with g_free().
- */
 static char *
 expand_path(const char *path_template)
 {
@@ -51,21 +152,17 @@ expand_path(const char *path_template)
     if (path_template == NULL || path_template[0] != '~')
         return g_strdup(path_template);
 
-    home = g_get_home_dir();   /* GLib: uses $HOME or falls back to /etc/passwd */
+    home = g_get_home_dir();
     if (home == NULL)
         home = "/tmp";
 
     return g_strconcat(home, path_template + 1, NULL);
 }
 
-/**
- * Build the dynamic gowails-chatai path from the current username.
- * Returns a newly allocated string; caller must free with g_free().
- */
 static char *
 get_dynamic_user_path(void)
 {
-    const char *user = g_get_user_name();  /* GLib: uses $USER or /etc/passwd */
+    const char *user = g_get_user_name();
     if (user == NULL)
         user = "fajar";
 
@@ -74,10 +171,6 @@ get_dynamic_user_path(void)
         user);
 }
 
-/**
- * Return the fully expanded path for a config item.
- * Caller must free the result with g_free().
- */
 static char *
 get_config_path(int index)
 {
@@ -94,9 +187,6 @@ get_config_path(int index)
  *  Utility helpers
  * ──────────────────────────────────────────────────────────────────────── */
 
-/**
- * Check whether a command exists and is executable somewhere in $PATH.
- */
 static int
 command_exists(const char *cmd)
 {
@@ -125,11 +215,6 @@ command_exists(const char *cmd)
  *  Callbacks
  * ──────────────────────────────────────────────────────────────────────── */
 
-/**
- * "Open with Sublime Text" button callback.
- * Expands the path, validates 'subl' availability, checks file existence,
- * then fork()/execlp() to launch Sublime Text.
- */
 static void
 on_open_clicked(GtkButton *button, gpointer user_data)
 {
@@ -138,7 +223,6 @@ on_open_clicked(GtkButton *button, gpointer user_data)
     if (full_path == NULL)
         return;
 
-    /* ---- Check that 'subl' is available in PATH ---- */
     if (!command_exists("subl")) {
         GtkWidget *dialog = gtk_message_dialog_new(
             GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(button))),
@@ -157,7 +241,6 @@ on_open_clicked(GtkButton *button, gpointer user_data)
         return;
     }
 
-    /* ---- Check if the file exists (warning only) ---- */
     if (!g_file_test(full_path, G_FILE_TEST_IS_REGULAR)) {
         GtkWidget *dialog = gtk_message_dialog_new(
             GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(button))),
@@ -171,25 +254,15 @@ on_open_clicked(GtkButton *button, gpointer user_data)
         gtk_widget_destroy(dialog);
     }
 
-    /* ---- Fork and exec subl ---- */
     pid_t pid = fork();
 
     if (pid == 0) {
-        /* Child process: exec subl.
-         *
-         * The file path is passed as a single argv element (argv[1]).
-         * Since execlp() does NOT go through a shell, spaces in the path
-         * are preserved correctly — no quoting or escaping needed. */
         execlp("subl", "subl", full_path, (char *)NULL);
-
-        /* If execlp returns, it failed */
         fprintf(stderr,
                 "[config-opener] Failed to exec 'subl' with path '%s': %s\n",
                 full_path, strerror(errno));
         _exit(1);
-
     } else if (pid < 0) {
-        /* Fork failed — show error dialog */
         GtkWidget *dialog = gtk_message_dialog_new(
             GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(button))),
             GTK_DIALOG_DESTROY_WITH_PARENT,
@@ -201,13 +274,9 @@ on_open_clicked(GtkButton *button, gpointer user_data)
         gtk_widget_destroy(dialog);
     }
 
-    /* Parent continues — child runs independently */
     g_free(full_path);
 }
 
-/**
- * Window "destroy" event → quit the GTK main loop.
- */
 static void
 on_destroy(GtkWidget *widget, gpointer data)
 {
@@ -217,24 +286,66 @@ on_destroy(GtkWidget *widget, gpointer data)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
- *  Widget creation helpers
+ *  Apply CSS
  * ──────────────────────────────────────────────────────────────────────── */
 
-/**
- * Create a bold header label (for the grid column headers).
- */
-static GtkWidget *
-create_header_label(const char *text)
+static void
+apply_css(void)
 {
-    GtkWidget *label = gtk_label_new(NULL);
-    gchar     *markup = g_strdup_printf("<b>%s</b>", text);
+    GtkCssProvider *provider = gtk_css_provider_new();
+    GError         *error   = NULL;
 
-    gtk_label_set_markup(GTK_LABEL(label), markup);
-    g_free(markup);
+    gtk_css_provider_load_from_data(provider, APP_CSS, -1, &error);
+    if (error != NULL) {
+        g_warning("CSS load error: %s", error->message);
+        g_error_free(error);
+    }
 
-    gtk_widget_set_halign(label, GTK_ALIGN_START);
-    gtk_widget_set_valign(label, GTK_ALIGN_CENTER);
-    return label;
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    g_object_unref(provider);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Build a single list row
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static GtkWidget *
+create_config_row(int index)
+{
+    /* Horizontal box: [ label (expand) | button ] */
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+    /* Config name */
+    GtkWidget *name = gtk_label_new(configs[index].name);
+    gtk_widget_set_halign(name, GTK_ALIGN_START);
+    gtk_widget_set_valign(name, GTK_ALIGN_CENTER);
+    gtk_widget_set_hexpand(name, TRUE);
+    gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_END);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(name), "config-name");
+    gtk_box_pack_start(GTK_BOX(hbox), name, TRUE, TRUE, 0);
+
+    /* Open button */
+    GtkWidget *btn = gtk_button_new_with_label("Open in Sublime Text");
+    g_signal_connect(btn, "clicked",
+                     G_CALLBACK(on_open_clicked),
+                     GINT_TO_POINTER(index));
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(btn), "open-button");
+    gtk_box_pack_start(GTK_BOX(hbox), btn, FALSE, FALSE, 0);
+
+    /* Tooltip with the full path */
+    char *full_path = get_config_path(index);
+    if (full_path) {
+        gtk_widget_set_tooltip_text(btn, full_path);
+        g_free(full_path);
+    }
+
+    return hbox;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -246,74 +357,75 @@ main(int argc, char *argv[])
 {
     gtk_init(&argc, &argv);
 
-    /* Auto-reap child processes so we don't leave zombies */
+    /* Apply stylesheet */
+    apply_css();
+
+    /* Auto-reap child processes */
     signal(SIGCHLD, SIG_IGN);
 
     /* ── Main window ── */
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window),
                          "Config Opener - Sublime Text Launcher");
-    gtk_window_set_default_size(GTK_WINDOW(window), 500, 300);
+    gtk_window_set_default_size(GTK_WINDOW(window), 540, 350);
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
 
-    /* ── Root vertical box with padding ── */
-    GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_container_set_border_width(GTK_CONTAINER(main_box), 12);
-    gtk_container_add(GTK_CONTAINER(window), main_box);
+    /* ── Root vertical box (no spacing — handled by children) ── */
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(window), root);
 
-    /* ── Title bar ── */
+    /* ── Header ── */
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(header), "header-box");
+    gtk_box_pack_start(GTK_BOX(root), header, FALSE, FALSE, 0);
+
     GtkWidget *title = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(title), "<b>Configuration Files</b>");
-    gtk_box_pack_start(GTK_BOX(main_box), title, FALSE, FALSE, 0);
+    gtk_label_set_markup(GTK_LABEL(title),
+                         "<span font_weight=\"bold\" size=\"12000\">"
+                         "Configuration Files</span>");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(title), "title-label");
+    gtk_box_pack_start(GTK_BOX(header), title, FALSE, FALSE, 0);
 
-    /* ── Separator ── */
-    GtkWidget *separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_box_pack_start(GTK_BOX(main_box), separator, FALSE, FALSE, 2);
+    gchar *sub_text = g_strdup_printf(
+        "%d config files  ·  click to open with Sublime Text", MAX_CONFIGS);
+    GtkWidget *subtitle = gtk_label_new(sub_text);
+    g_free(sub_text);
+    gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(subtitle), "subtitle-label");
+    gtk_box_pack_start(GTK_BOX(header), subtitle, FALSE, FALSE, 0);
 
     /* ── Scrolled window ── */
     GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
                                     GTK_POLICY_NEVER,
                                     GTK_POLICY_AUTOMATIC);
-    gtk_box_pack_start(GTK_BOX(main_box), scrolled, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
 
-    /* ── Grid: 2 columns (config name | action button) ── */
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
-    gtk_container_add(GTK_CONTAINER(scrolled), grid);
+    /* ── List box for config items ── */
+    GtkWidget *listbox = gtk_list_box_new();
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(listbox), FALSE);
+    gtk_container_add(GTK_CONTAINER(scrolled), listbox);
 
-    /* Column headers */
-    GtkWidget *hdr_name   = create_header_label("Config Name");
-    GtkWidget *hdr_action = create_header_label("Action");
-    gtk_grid_attach(GTK_GRID(grid), hdr_name,   0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), hdr_action, 1, 0, 1, 1);
-
-    /* Separator row under headers */
-    GtkWidget *grid_sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_grid_attach(GTK_GRID(grid), grid_sep, 0, 1, 2, 1);
-
-    /* Config item rows */
     for (int i = 0; i < MAX_CONFIGS; i++) {
-        int row = i + 2;
-
-        /* Config name label (left-aligned, ellipsized if too long) */
-        GtkWidget *name = gtk_label_new(configs[i].name);
-        gtk_widget_set_halign(name, GTK_ALIGN_START);
-        gtk_widget_set_valign(name, GTK_ALIGN_CENTER);
-        gtk_label_set_ellipsize(GTK_LABEL(name), PANGO_ELLIPSIZE_END);
-        gtk_grid_attach(GTK_GRID(grid), name, 0, row, 1, 1);
-
-        /* "Open with Sublime Text" button */
-        GtkWidget *btn = gtk_button_new_with_label("Open with Sublime Text");
-        g_signal_connect(btn, "clicked",
-                         G_CALLBACK(on_open_clicked),
-                         GINT_TO_POINTER(i));
-        gtk_widget_set_halign(btn, GTK_ALIGN_START);
-        gtk_grid_attach(GTK_GRID(grid), btn, 1, row, 1, 1);
+        GtkWidget *row = create_config_row(i);
+        gtk_container_add(GTK_CONTAINER(listbox), row);
     }
 
-    /* ── Show everything and enter the main loop ── */
+    /* ── Status bar ── */
+    gchar *status_text = g_strdup_printf(
+        "✓  %d configuration files  ·  Sublime Text Launcher", MAX_CONFIGS);
+    GtkWidget *status = gtk_label_new(status_text);
+    g_free(status_text);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(status), "status-bar");
+    gtk_widget_set_halign(status, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(root), status, FALSE, FALSE, 0);
+
+    /* ── Show and run ── */
     gtk_widget_show_all(window);
     gtk_main();
 
