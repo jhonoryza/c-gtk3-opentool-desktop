@@ -92,8 +92,21 @@ make
 gcc -std=c99 -Wall -Wextra -o config-opener main.c $(pkg-config --cflags --libs gtk+-3.0)
 ```
 
+### 4. Install sebagai macOS App (Optional)
+
+Untuk bisa membuka dari Spotlight (Cmd+Space):
+
+```bash
+# Install ke /Applications
+make install-app
+
+# Uninstall
+make uninstall-app
+```
+
 ## 🚀 Penggunaan
 
+### CLI Mode
 ```bash
 # Jalankan aplikasi
 make run
@@ -102,16 +115,33 @@ make run
 ./config-opener
 ```
 
-Aplikasi akan menampilkan window dengan daftar file konfigurasi. Klik **"Open with Sublime Text"** untuk membuka file.
+### macOS App (Spotlight)
+```bash
+# Install sebagai macOS app (bisa dibuka dari Spotlight)
+make install-app
+
+# Atau gunakan script installer
+./install.sh
+
+# Uninstall
+make uninstall-app
+# atau
+./uninstall.sh
+```
+
+Setelah install, buka Spotlight (Cmd+Space) dan cari "Config Opener".
 
 ## 📁 Struktur Proyek
 
 ```
 config-opener/
-├── main.c        # Kode utama aplikasi
-├── Makefile      # Build system
-├── README.md     # Dokumentasi (file ini)
-└── LICENSE       # Lisensi MIT
+├── main.c           # Kode utama aplikasi
+├── Makefile         # Build system
+├── Info.plist       # macOS app bundle metadata
+├── install.sh       # Installer script
+├── uninstall.sh     # Uninstaller script
+├── README.md        # Dokumentasi (file ini)
+└── LICENSE          # Lisensi MIT
 ```
 
 ## ⚙️ Teknis
