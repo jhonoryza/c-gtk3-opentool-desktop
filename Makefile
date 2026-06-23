@@ -3,13 +3,13 @@
 
 CC      ?= gcc
 CFLAGS  ?= -std=c99 -Wall -Wextra -O2
-GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0)
-GTK_LIBS    := $(shell pkg-config --libs gtk+-3.0)
+GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0 sqlite3)
+GTK_LIBS    := $(shell pkg-config --libs gtk+-3.0 sqlite3)
 TARGET  := config-opener
 SRCS    := main.c
 OBJS    := main.o
 
-.PHONY: all run clean install uninstall clangd clean-clangd app-bundle install-app uninstall-app
+.PHONY: all run clean install uninstall clangd clean-clangd app-bundle install-app uninstall-app icon clean-icon
 
 all: $(TARGET)
 
@@ -62,8 +62,8 @@ run: $(TARGET)
 clean:
 	rm -f $(OBJS) $(TARGET)
 
-clean-all: clean clean-clangd
-	@echo "✅ All build artifacts and .clangd removed"
+clean-all: clean clean-clangd clean-icon
+	@echo "✅ All build artifacts, .clangd and AppIcon.icns removed"
 
 # ── Installation (optional) ──
 
@@ -86,7 +86,32 @@ MACOS_DIR   := Config\ Opener.app/Contents/MacOS
 RES_DIR     := Config\ Opener.app/Contents/Resources
 APP_DEST    ?= /Applications
 
-app-bundle: $(TARGET)
+# Generate AppIcon.icns from logo-512.png using built-in macOS tools.
+AppIcon.icns: logo-512.png
+	@echo "Generating AppIcon.icns from logo-512.png..."
+	@rm -rf AppIcon.iconset
+	@mkdir -p AppIcon.iconset
+	@sips -z 16   16   logo-512.png --out AppIcon.iconset/icon_16x16.png       >/dev/null
+	@sips -z 32   32   logo-512.png --out AppIcon.iconset/icon_16x16@2x.png    >/dev/null
+	@sips -z 32   32   logo-512.png --out AppIcon.iconset/icon_32x32.png       >/dev/null
+	@sips -z 64   64   logo-512.png --out AppIcon.iconset/icon_32x32@2x.png    >/dev/null
+	@sips -z 128  128  logo-512.png --out AppIcon.iconset/icon_128x128.png     >/dev/null
+	@sips -z 256  256  logo-512.png --out AppIcon.iconset/icon_128x128@2x.png  >/dev/null
+	@sips -z 256  256  logo-512.png --out AppIcon.iconset/icon_256x256.png     >/dev/null
+	@sips -z 512  512  logo-512.png --out AppIcon.iconset/icon_256x256@2x.png  >/dev/null
+	@sips -z 512  512  logo-512.png --out AppIcon.iconset/icon_512x512.png     >/dev/null
+	@cp logo-512.png AppIcon.iconset/icon_512x512@2x.png
+	@iconutil -c icns AppIcon.iconset -o AppIcon.icns
+	@rm -rf AppIcon.iconset
+	@echo "✅ AppIcon.icns generated"
+
+icon: AppIcon.icns
+
+clean-icon:
+	@rm -rf AppIcon.icns AppIcon.iconset
+	@echo "✅ AppIcon.icns removed"
+
+app-bundle: $(TARGET) AppIcon.icns
 	@echo "Creating app bundle..."
 	@rm -rf "Config Opener.app"
 	@mkdir -p "Config Opener.app/Contents/MacOS" "Config Opener.app/Contents/Resources"
@@ -94,7 +119,8 @@ app-bundle: $(TARGET)
 	@cp Info.plist "Config Opener.app/Contents/Info.plist"
 	@printf '#!/bin/bash\nexport PATH="/opt/homebrew/bin:/usr/local/bin:$$PATH"\nexport XDG_DATA_DIRS="/opt/homebrew/share:/usr/local/share:$${XDG_DATA_DIRS:-}"\nDIR="$$(cd "$$(dirname "$$0")" && pwd)"\nexec "$$DIR/$(TARGET)"\n' > "Config Opener.app/Contents/MacOS/launcher"
 	@chmod +x "Config Opener.app/Contents/MacOS/launcher"
-	@if [ -f AppIcon.icns ]; then cp AppIcon.icns "Config Opener.app/Contents/Resources/AppIcon.icns"; else touch "Config Opener.app/Contents/Resources/AppIcon.icns"; fi
+	@cp AppIcon.icns "Config Opener.app/Contents/Resources/AppIcon.icns"
+	@cp logo-512.png "Config Opener.app/Contents/Resources/logo-512.png"
 	@echo "✅ Config Opener.app created"
 
 install-app: app-bundle
@@ -124,6 +150,11 @@ check-deps:
 		exit 1; \
 	}
 	@echo "  ✓ GTK3 found"
+	@pkg-config --exists sqlite3 || { \
+		echo "ERROR: sqlite3 not found. Install with: brew install sqlite3"; \
+		exit 1; \
+	}
+	@echo "  ✓ sqlite3 found"
 	@which subl >/dev/null 2>&1 || { \
 		echo "WARNING: 'subl' not found in PATH."; \
 		echo "  Install: ln -s /Applications/Sublime\\ Text.app/Contents/SharedSupport/bin/subl /usr/local/bin/subl"; \
