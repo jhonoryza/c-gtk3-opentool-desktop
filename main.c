@@ -1712,6 +1712,400 @@ build_home_tab(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+ *  OpenCode Session Manager tab
+ *  Reads ~/.local/share/opencode/opencode.db (external SQLite, read-only)
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char *id;
+    char *title;
+    char *directory;
+    long  time_created;
+    long  time_updated;
+    char *project_id;
+} OpenCodeSession;
+
+static GtkWidget *g_opencode_list_box  = NULL;
+static GtkWidget *g_opencode_count_lbl = NULL;
+static GtkWidget *g_opencode_search    = NULL;
+
+static void refresh_opencode_list(void);
+
+static void
+opencode_session_free(OpenCodeSession *s)
+{
+    if (s == NULL) return;
+    g_free(s->id);
+    g_free(s->title);
+    g_free(s->directory);
+    g_free(s->project_id);
+    g_free(s);
+}
+
+static char *
+get_opencode_db_path(void)
+{
+    const char *xdg = g_getenv("XDG_DATA_HOME");
+    if (xdg != NULL && *xdg != '\0')
+        return g_strdup_printf("%s/opencode/opencode.db", xdg);
+    const char *home = g_get_home_dir();
+    if (home == NULL) home = "/tmp";
+    return g_strdup_printf("%s/.local/share/opencode/opencode.db", home);
+}
+
+static char *
+format_relative_time(long msecs)
+{
+    time_t now = time(NULL);
+    long secs_ago = now - (msecs / 1000);
+    if (secs_ago < 0) secs_ago = 0;
+
+    if (secs_ago < 60)
+        return g_strdup("just now");
+    else if (secs_ago < 3600)
+        return g_strdup_printf("%ldm ago", secs_ago / 60);
+    else if (secs_ago < 86400)
+        return g_strdup_printf("%ldh ago", secs_ago / 3600);
+    else if (secs_ago < 2592000)
+        return g_strdup_printf("%ldd ago", secs_ago / 86400);
+    else
+        return g_strdup_printf("%ldmo ago", secs_ago / 2592000);
+}
+
+static char *
+display_path(const char *path)
+{
+    if (path == NULL) return g_strdup("");
+    const char *home = g_get_home_dir();
+    if (home != NULL && g_str_has_prefix(path, home))
+        return g_strdup_printf("~%s", path + strlen(home));
+    return g_strdup(path);
+}
+
+static GPtrArray *
+opencode_load_sessions(const char *search)
+{
+    GPtrArray *arr = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)opencode_session_free);
+
+    char *db_path = get_opencode_db_path();
+    if (!g_file_test(db_path, G_FILE_TEST_IS_REGULAR)) {
+        g_free(db_path);
+        return arr;
+    }
+
+    sqlite3 *oc_db = NULL;
+    if (sqlite3_open_v2(db_path, &oc_db,
+                        SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        g_free(db_path);
+        if (oc_db) sqlite3_close(oc_db);
+        return arr;
+    }
+
+    const char *base_sql =
+        "SELECT id, title, directory, time_created, time_updated, "
+        "project_id FROM session WHERE parent_id IS NULL";
+
+    char sql[2048];
+    if (search != NULL && *search != '\0') {
+        char *esc = g_strescape(search, NULL);
+        snprintf(sql, sizeof(sql),
+            "%s AND (title LIKE '%%%s%%' OR directory LIKE '%%%s%%') "
+            "ORDER BY time_updated DESC LIMIT 500;",
+            base_sql, esc, esc);
+        g_free(esc);
+    } else {
+        snprintf(sql, sizeof(sql),
+            "%s ORDER BY time_updated DESC LIMIT 500;", base_sql);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(oc_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            OpenCodeSession *s = g_new0(OpenCodeSession, 1);
+            s->id           = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+            s->title        = g_strdup((const char *)sqlite3_column_text(stmt, 1));
+            s->directory    = g_strdup((const char *)sqlite3_column_text(stmt, 2));
+            s->time_created = sqlite3_column_int64(stmt, 3);
+            s->time_updated = sqlite3_column_int64(stmt, 4);
+            s->project_id   = g_strdup((const char *)sqlite3_column_text(stmt, 5));
+            if (s->title == NULL || *s->title == '\0') s->title = g_strdup("(untitled)");
+            g_ptr_array_add(arr, s);
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(oc_db);
+    g_free(db_path);
+    return arr;
+}
+
+static void
+on_opencode_resume_clicked(GtkButton *button, gpointer user_data)
+{
+    OpenCodeSession *s = (OpenCodeSession *)user_data;
+    (void)button;
+    char *cmd = g_strdup_printf("opencode -s %s", s->id);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("opencode", "opencode", "-s", s->id, (char *)NULL);
+        _exit(1);
+    }
+    g_free(cmd);
+    if (g_status_label)
+        set_status("Launching opencode session: %s", s->title);
+}
+
+static void
+on_opencode_open_dir_clicked(GtkButton *button, gpointer user_data)
+{
+    OpenCodeSession *s = (OpenCodeSession *)user_data;
+    if (s->directory == NULL) return;
+    launch_editor(GTK_WIDGET(button), s->directory);
+}
+
+static void
+on_opencode_delete_clicked(GtkButton *button, gpointer user_data)
+{
+    OpenCodeSession *s = (OpenCodeSession *)user_data;
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(g_main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_YES_NO,
+        "Delete session '%s'?", s->title);
+    gint resp = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    if (resp != GTK_RESPONSE_YES) return;
+
+    char *db_path = get_opencode_db_path();
+    sqlite3 *oc_db = NULL;
+    if (sqlite3_open(db_path, &oc_db) == SQLITE_OK) {
+        char *sql = g_strdup_printf(
+            "DELETE FROM session WHERE id = '%s';", s->id);
+        sqlite3_exec(oc_db, sql, NULL, NULL, NULL);
+        g_free(sql);
+        sqlite3_close(oc_db);
+        set_status("Deleted session '%s'", s->title);
+        refresh_opencode_list();
+    }
+    g_free(db_path);
+}
+
+static void refresh_opencode_list(void);
+
+static GtkWidget *
+create_opencode_row(OpenCodeSession *s)
+{
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox,   12);
+    gtk_widget_set_margin_end(hbox,     8);
+    gtk_widget_set_margin_top(hbox,     6);
+    gtk_widget_set_margin_bottom(hbox,  6);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(vbox, TRUE);
+
+    GString *markup = g_string_new(NULL);
+    g_string_printf(markup, "<b>%s</b>", s->title);
+    char *rel = format_relative_time(s->time_updated);
+    g_string_append_printf(markup, "  <span size=\"small\" "
+        "foreground=\"#86868b\">%s</span>", rel);
+    g_free(rel);
+
+    GtkWidget *title_lbl = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title_lbl), markup->str);
+    g_string_free(markup, TRUE);
+    gtk_widget_set_halign(title_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(title_lbl), PANGO_ELLIPSIZE_END);
+    gtk_box_pack_start(GTK_BOX(vbox), title_lbl, FALSE, FALSE, 0);
+
+    char *dpath = display_path(s->directory);
+    GtkWidget *dir_lbl = gtk_label_new(dpath);
+    g_free(dpath);
+    gtk_widget_set_halign(dir_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(dir_lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(dir_lbl), "account-meta");
+    gtk_box_pack_start(GTK_BOX(vbox), dir_lbl, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(hbox), vbox, TRUE, TRUE, 0);
+
+    GtkWidget *resume_btn = gtk_button_new_with_label("Resume");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(resume_btn), "open-button");
+    g_signal_connect(resume_btn, "clicked",
+                     G_CALLBACK(on_opencode_resume_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), resume_btn, FALSE, FALSE, 0);
+
+    GtkWidget *open_dir_btn = gtk_button_new_with_label("Open Dir");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(open_dir_btn), "edit-button");
+    g_signal_connect(open_dir_btn, "clicked",
+                     G_CALLBACK(on_opencode_open_dir_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), open_dir_btn, FALSE, FALSE, 0);
+
+    GtkWidget *del_btn = gtk_button_new_with_label("Delete");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(del_btn), "delete-button");
+    g_signal_connect(del_btn, "clicked",
+                     G_CALLBACK(on_opencode_delete_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), del_btn, FALSE, FALSE, 0);
+
+    return hbox;
+}
+
+static void
+on_opencode_search_changed(GtkSearchEntry *entry, gpointer data)
+{
+    (void)data;
+    (void)entry;
+    refresh_opencode_list();
+}
+
+static void
+refresh_opencode_list(void)
+{
+    if (g_opencode_list_box == NULL) return;
+
+    GList *kids = gtk_container_get_children(
+        GTK_CONTAINER(g_opencode_list_box));
+    for (GList *l = kids; l != NULL; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    const char *search = g_opencode_search
+        ? gtk_entry_get_text(GTK_ENTRY(g_opencode_search))
+        : NULL;
+
+    GPtrArray *sessions = opencode_load_sessions(search);
+
+    if (g_opencode_count_lbl) {
+        char *count_text = g_strdup_printf("%d sessions", sessions->len);
+        gtk_label_set_text(GTK_LABEL(g_opencode_count_lbl), count_text);
+        g_free(count_text);
+    }
+
+    if (sessions->len == 0) {
+        GtkWidget *row = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+        char *db_path = get_opencode_db_path();
+        char *msg;
+        if (!g_file_test(db_path, G_FILE_TEST_IS_REGULAR))
+            msg = g_strdup_printf(
+                "opencode.db not found at:\n%s\n\n"
+                "Start an opencode session first to populate the index.",
+                db_path);
+        else
+            msg = g_strdup("No sessions found.");
+        g_free(db_path);
+
+        GtkWidget *empty = gtk_label_new(msg);
+        g_free(msg);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(empty), "empty-label");
+        gtk_widget_set_halign(empty, GTK_ALIGN_CENTER);
+        gtk_container_add(GTK_CONTAINER(row), empty);
+        gtk_container_add(GTK_CONTAINER(g_opencode_list_box), row);
+    } else {
+        for (guint i = 0; i < sessions->len; i++) {
+            OpenCodeSession *s = g_ptr_array_index(sessions, i);
+            g_ptr_array_index(sessions, i) = NULL;
+
+            GtkWidget *row = gtk_list_box_row_new();
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+            GtkWidget *content = create_opencode_row(s);
+            gtk_container_add(GTK_CONTAINER(row), content);
+            gtk_container_add(GTK_CONTAINER(g_opencode_list_box), row);
+
+            g_object_set_data_full(G_OBJECT(row), "session",
+                s, (GDestroyNotify)opencode_session_free);
+        }
+    }
+    g_ptr_array_free(sessions, TRUE);
+    gtk_widget_show_all(g_opencode_list_box);
+}
+
+static GtkWidget *
+build_opencode_tab(void)
+{
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    /* Header */
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(header), "header-box");
+    gtk_box_pack_start(GTK_BOX(root), header, FALSE, FALSE, 0);
+
+    GtkWidget *header_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(header_text, TRUE);
+
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title),
+        "<span font_weight=\"bold\" size=\"12000\">"
+        "OpenCode Sessions</span>");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(title), "title-label");
+    gtk_box_pack_start(GTK_BOX(header_text), title, FALSE, FALSE, 0);
+
+    GtkWidget *subtitle = gtk_label_new(
+        "Resume or manage OpenCode CLI sessions");
+    gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(subtitle), "subtitle-label");
+    gtk_box_pack_start(GTK_BOX(header_text), subtitle, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(header), header_text, TRUE, TRUE, 0);
+
+    g_opencode_count_lbl = gtk_label_new("");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(g_opencode_count_lbl),
+        "subtitle-label");
+    gtk_box_pack_end(GTK_BOX(header), g_opencode_count_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *refresh_btn = gtk_button_new_with_label("Refresh");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(refresh_btn), "edit-button");
+    g_signal_connect_swapped(refresh_btn, "clicked",
+        G_CALLBACK(refresh_opencode_list), NULL);
+    gtk_box_pack_end(GTK_BOX(header), refresh_btn, FALSE, FALSE, 0);
+
+    /* Search bar */
+    GtkWidget *search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_margin_start(search_bar,   12);
+    gtk_widget_set_margin_end(search_bar,     12);
+    gtk_widget_set_margin_top(search_bar,      8);
+    gtk_widget_set_margin_bottom(search_bar,   8);
+
+    g_opencode_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_opencode_search),
+        "Search by title or directory...");
+    gtk_widget_set_hexpand(g_opencode_search, TRUE);
+    g_signal_connect(g_opencode_search, "search-changed",
+                     G_CALLBACK(on_opencode_search_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(search_bar), g_opencode_search, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), search_bar, FALSE, FALSE, 0);
+
+    /* Scrolled list */
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                    GTK_POLICY_NEVER,
+                                    GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
+
+    g_opencode_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_opencode_list_box),
+                                     GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(scrolled), g_opencode_list_box);
+
+    refresh_opencode_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  *  Config Opener tab (tab 1) — dynamic, SQLite-backed
  * ──────────────────────────────────────────────────────────────────────── */
 
@@ -2888,6 +3282,10 @@ main(int argc, char *argv[])
     GtkWidget *tab_home = build_home_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_home,
         gtk_label_new("Home"));
+
+    GtkWidget *tab_opencode = build_opencode_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_opencode,
+        gtk_label_new("OpenCode"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
