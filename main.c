@@ -58,6 +58,7 @@ static GtkWidget     *g_plugins_list_box  = NULL;
 static GtkWidget     *g_main_window       = NULL;
 static GtkWidget     *g_status_label      = NULL;
 static GtkWidget     *g_theme_btn         = NULL;
+static GtkWidget     *g_notebook          = NULL;
 static GtkCssProvider *g_css_provider     = NULL;
 static gboolean       g_dark_mode         = FALSE;
 
@@ -393,6 +394,56 @@ static const char *CSS_BODY =
     "scrolledwindow undershoot,"
     "scrolledwindow overshoot {"
     "  background-color: transparent;"
+    "}"
+
+    /* ── Home dashboard cards ── */
+    ".home-card {"
+    "  background-color: @c_bg_card;"
+    "  border: 1px solid @c_border;"
+    "  border-radius: 8px;"
+    "  padding: 16px;"
+    "}"
+    ".home-card:hover {"
+    "  background-color: @c_bg_hover;"
+    "  border-color: @c_accent;"
+    "  transition: all 150ms ease;"
+    "}"
+    ".home-card-icon {"
+    "  font-size: 28px;"
+    "  color: @c_accent;"
+    "  min-height: 36px;"
+    "}"
+    ".home-card-title {"
+    "  font-size: 13px;"
+    "  font-weight: 600;"
+    "  color: @c_text_primary;"
+    "}"
+    ".home-card-desc {"
+    "  font-size: 11px;"
+    "  color: @c_text_secondary;"
+    "  margin-top: 2px;"
+    "}"
+
+    /* ── Home keyboard shortcut badges ── */
+    ".home-shortcut-key {"
+    "  background-color: @c_btn_sec_bg;"
+    "  border: 1px solid @c_border;"
+    "  border-radius: 4px;"
+    "  padding: 2px 8px;"
+    "  font-size: 11px;"
+    "  font-family: monospace;"
+    "  color: @c_text_primary;"
+    "}"
+    ".home-shortcut-desc {"
+    "  font-size: 11px;"
+    "  color: @c_text_secondary;"
+    "}"
+    ".home-section-title {"
+    "  font-size: 14px;"
+    "  font-weight: bold;"
+    "  color: @c_text_primary;"
+    "  margin-top: 16px;"
+    "  margin-bottom: 8px;"
     "}"
     ;
 
@@ -1469,6 +1520,195 @@ mask_api_key(const char *key)
     memcpy(head, key, hn); head[hn] = 0;
     memcpy(tail, key + len - tn, tn); tail[tn] = 0;
     return g_strdup_printf("%s•••••%s", head, tail);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Home tab -- dashboard with shortcut cards + keyboard shortcuts
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    const char *icon;
+    const char *title;
+    const char *desc;
+    int         tab_index;
+} HomeCard;
+
+static const HomeCard g_home_cards[] = {
+    {"📄", "OpenCode",        "Resume dev sessions",         1},
+    {"🤖", "Claude",          "Indexed CLI sessions",        2},
+    {"🔑", "SSH",             "Remote connections",          3},
+    {"💻", "Terminal",        "Local PTY terminal",          4},
+    {"🌐", "Chat Web",        "Embedded AI chats",           5},
+    {"🔥", "Kimchi",          "Kimchi session index",        6},
+    {"📱", "Mimo",            "Mimo session index",          7},
+    {"⚡", "Freebuff",        "Freebuff session index",      8},
+    {"🔌", "Port Monitor",    "Active TCP ports",            9},
+    {"⚙️", "Config Opener",   "Edit config files",           1},
+    {"🔄", "Claude Switcher", "Switch API accounts",         2},
+    {NULL, NULL, NULL, -1},
+};
+
+static void
+on_home_card_clicked(GtkButton *button, gpointer user_data)
+{
+    (void)button;
+    int idx = GPOINTER_TO_INT(user_data);
+    if (g_notebook != NULL && idx >= 0) {
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(g_notebook), idx);
+    }
+}
+
+static GtkWidget *
+create_home_card(const HomeCard *card)
+{
+    GtkWidget *btn = gtk_button_new();
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(btn), "home-card");
+    gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
+    g_signal_connect(btn, "clicked",
+                     G_CALLBACK(on_home_card_clicked),
+                     GINT_TO_POINTER(card->tab_index));
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_halign(vbox, GTK_ALIGN_START);
+
+    GtkWidget *icon = gtk_label_new(card->icon);
+    gtk_widget_set_halign(icon, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(icon), "home-card-icon");
+    gtk_box_pack_start(GTK_BOX(vbox), icon, FALSE, FALSE, 0);
+
+    GtkWidget *title = gtk_label_new(card->title);
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(title), "home-card-title");
+    gtk_box_pack_start(GTK_BOX(vbox), title, FALSE, FALSE, 0);
+
+    GtkWidget *desc = gtk_label_new(card->desc);
+    gtk_widget_set_halign(desc, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(desc), PANGO_ELLIPSIZE_END);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(desc), "home-card-desc");
+    gtk_box_pack_start(GTK_BOX(vbox), desc, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(btn), vbox);
+    return btn;
+}
+
+static GtkWidget *
+create_shortcut_row(const char *key, const char *desc)
+{
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_top(hbox, 2);
+    gtk_widget_set_margin_bottom(hbox, 2);
+
+    GtkWidget *key_label = gtk_label_new(key);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(key_label), "home-shortcut-key");
+    gtk_widget_set_halign(key_label, GTK_ALIGN_START);
+    gtk_widget_set_size_request(key_label, 100, -1);
+    gtk_box_pack_start(GTK_BOX(hbox), key_label, FALSE, FALSE, 0);
+
+    GtkWidget *desc_label = gtk_label_new(desc);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(desc_label), "home-shortcut-desc");
+    gtk_widget_set_halign(desc_label, GTK_ALIGN_START);
+    gtk_widget_set_hexpand(desc_label, TRUE);
+    gtk_box_pack_start(GTK_BOX(hbox), desc_label, TRUE, TRUE, 0);
+
+    return hbox;
+}
+
+static GtkWidget *
+build_home_tab(void)
+{
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                    GTK_POLICY_NEVER,
+                                    GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
+
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(content,   24);
+    gtk_widget_set_margin_end(content,     24);
+    gtk_widget_set_margin_top(content,     20);
+    gtk_widget_set_margin_bottom(content,  20);
+
+    GtkWidget *welcome = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(welcome),
+        "<span size=\"xx-large\" font_weight=\"bold\">"
+        "Opentool Desktop</span>");
+    gtk_widget_set_halign(welcome, GTK_ALIGN_START);
+    gtk_widget_set_margin_bottom(welcome, 4);
+    gtk_box_pack_start(GTK_BOX(content), welcome, FALSE, FALSE, 0);
+
+    GtkWidget *subtitle = gtk_label_new(
+        "Manage CLI sessions, terminals, and developer tools from one place.");
+    gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(subtitle), "subtitle-label");
+    gtk_widget_set_margin_bottom(subtitle, 16);
+    gtk_box_pack_start(GTK_BOX(content), subtitle, FALSE, FALSE, 0);
+
+    GtkWidget *sec_title = gtk_label_new("Quick Access");
+    gtk_widget_set_halign(sec_title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(sec_title), "home-section-title");
+    gtk_box_pack_start(GTK_BOX(content), sec_title, FALSE, FALSE, 0);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
+    gtk_grid_set_column_homogeneous(GTK_GRID(grid), TRUE);
+
+    int col = 0;
+    int row = 0;
+    const int COLS = 4;
+    for (int i = 0; g_home_cards[i].icon != NULL; i++) {
+        GtkWidget *card = create_home_card(&g_home_cards[i]);
+        gtk_widget_set_hexpand(card, TRUE);
+        gtk_widget_set_vexpand(card, TRUE);
+        gtk_grid_attach(GTK_GRID(grid), card, col, row, 1, 1);
+        col++;
+        if (col >= COLS) {
+            col = 0;
+            row++;
+        }
+    }
+    gtk_box_pack_start(GTK_BOX(content), grid, FALSE, FALSE, 0);
+
+    GtkWidget *shortcuts_title = gtk_label_new("Keyboard Shortcuts");
+    gtk_widget_set_halign(shortcuts_title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(shortcuts_title), "home-section-title");
+    gtk_widget_set_margin_top(shortcuts_title, 16);
+    gtk_box_pack_start(GTK_BOX(content), shortcuts_title, FALSE, FALSE, 0);
+
+    static const struct {
+        const char *key;
+        const char *desc;
+    } shortcuts[] = {
+        {"Ctrl+K",     "Go to Home"},
+        {"Ctrl+P",     "Command Palette"},
+        {"Ctrl+W",     "Close window"},
+        {"Ctrl+Q",     "Quit application"},
+        {"Shift+↑/↓",  "Scroll terminal (3 lines)"},
+        {"Shift+Enter","Insert newline without submitting"},
+        {NULL, NULL},
+    };
+
+    GtkWidget *shortcuts_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    for (int i = 0; shortcuts[i].key != NULL; i++) {
+        GtkWidget *srow = create_shortcut_row(shortcuts[i].key,
+                                               shortcuts[i].desc);
+        gtk_box_pack_start(GTK_BOX(shortcuts_box), srow, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(content), shortcuts_box, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(scrolled), content);
+    return root;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -2641,7 +2881,13 @@ main(int argc, char *argv[])
 
     /* Notebook (tabs) */
     GtkWidget *notebook = gtk_notebook_new();
+    g_notebook = notebook;
     gtk_box_pack_start(GTK_BOX(root), notebook, TRUE, TRUE, 0);
+
+    /* Tab index must match g_home_cards[].tab_index */
+    GtkWidget *tab_home = build_home_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_home,
+        gtk_label_new("Home"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
