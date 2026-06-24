@@ -723,6 +723,14 @@ on_window_key_press(GtkWidget *window, GdkEventKey *event, gpointer data)
         gtk_main_quit();
         return TRUE;
     }
+    if (key == GDK_KEY_p && (mask & GDK_CONTROL_MASK) == GDK_CONTROL_MASK) {
+        palette_show();
+        return TRUE;
+    }
+    if (key == GDK_KEY_k && (mask & GDK_CONTROL_MASK) == GDK_CONTROL_MASK) {
+        if (g_notebook) gtk_notebook_set_current_page(GTK_NOTEBOOK(g_notebook), 0);
+        return TRUE;
+    }
 
     return FALSE;
 }
@@ -4531,6 +4539,211 @@ static GtkWidget *build_port_monitor_tab(void) {
     gtk_box_pack_start(GTK_BOX(root), sc, TRUE, TRUE, 0);
     refresh_port_list();
     return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Command Palette (Ctrl+P)
+ *  Overlay window with fuzzy search across all tabs
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static GtkWidget *g_palette_window    = NULL;
+static GtkWidget *g_palette_search    = NULL;
+static GtkWidget *g_palette_listbox   = NULL;
+static int        g_palette_selected  = 0;
+
+static void
+on_palette_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer data)
+{
+    (void)box; (void)data;
+    if (row == NULL || g_notebook == NULL) return;
+    int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "tab_idx"));
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(g_notebook), idx);
+    gtk_widget_hide(g_palette_window);
+}
+
+static void
+palette_filter(const char *query)
+{
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_palette_listbox));
+    for (GList *l = kids; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    int match = 0;
+    for (int i = 0; g_home_cards[i].icon != NULL; i++) {
+        const char *title = g_home_cards[i].title;
+        const char *desc  = g_home_cards[i].desc;
+        gboolean show = TRUE;
+
+        if (query && *query) {
+            show = FALSE;
+            gchar *query_lower = g_utf8_strdown(query, -1);
+            gchar *title_lower = g_utf8_strdown(title, -1);
+            gchar *desc_lower  = g_utf8_strdown(desc, -1);
+            if (strstr(title_lower, query_lower) ||
+                strstr(desc_lower, query_lower))
+                show = TRUE;
+            g_free(query_lower);
+            g_free(title_lower);
+            g_free(desc_lower);
+        }
+
+        if (!show) continue;
+
+        GtkWidget *row = gtk_list_box_row_new();
+        g_object_set_data(G_OBJECT(row), "tab_idx",
+            GINT_TO_POINTER(g_home_cards[i].tab_index));
+
+        GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+        gtk_widget_set_margin_start(hbox, 12);
+        gtk_widget_set_margin_end(hbox, 12);
+        gtk_widget_set_margin_top(hbox, 6);
+        gtk_widget_set_margin_bottom(hbox, 6);
+
+        GtkWidget *icon = gtk_label_new(g_home_cards[i].icon);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(icon), "home-card-icon");
+        gtk_box_pack_start(GTK_BOX(hbox), icon, FALSE, FALSE, 0);
+
+        GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        gtk_widget_set_hexpand(vbox, TRUE);
+
+        GtkWidget *t = gtk_label_new(title);
+        gtk_widget_set_halign(t, GTK_ALIGN_START);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(t), "account-name");
+        gtk_box_pack_start(GTK_BOX(vbox), t, FALSE, FALSE, 0);
+
+        GtkWidget *d = gtk_label_new(desc);
+        gtk_widget_set_halign(d, GTK_ALIGN_START);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(d), "account-meta");
+        gtk_box_pack_start(GTK_BOX(vbox), d, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(hbox), vbox, TRUE, TRUE, 0);
+        gtk_container_add(GTK_CONTAINER(row), hbox);
+        gtk_container_add(GTK_CONTAINER(g_palette_listbox), row);
+        match++;
+    }
+
+    if (match == 0) {
+        GtkWidget *row = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new("No matching tabs.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(row), e);
+        gtk_container_add(GTK_CONTAINER(g_palette_listbox), row);
+    }
+    gtk_widget_show_all(g_palette_listbox);
+    g_palette_selected = 0;
+}
+
+static void
+on_palette_search_changed(GtkSearchEntry *entry, gpointer data)
+{
+    (void)data;
+    const char *text = gtk_entry_get_text(GTK_ENTRY(entry));
+    palette_filter(text);
+}
+
+static gboolean
+on_palette_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data)
+{
+    (void)widget; (void)data;
+    int count = 0;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_palette_listbox));
+    count = g_list_length(kids);
+    g_list_free(kids);
+
+    if (event->keyval == GDK_KEY_Escape) {
+        gtk_widget_hide(g_palette_window);
+        return TRUE;
+    }
+    if (event->keyval == GDK_KEY_Down) {
+        g_palette_selected = (g_palette_selected + 1) % MAX(count, 1);
+        GtkListBoxRow *row = gtk_list_box_get_row_at_index(
+            GTK_LIST_BOX(g_palette_listbox), g_palette_selected);
+        if (row) gtk_list_box_select_row(
+            GTK_LIST_BOX(g_palette_listbox), row);
+        return TRUE;
+    }
+    if (event->keyval == GDK_KEY_Up) {
+        g_palette_selected = (g_palette_selected - 1 + count) % MAX(count, 1);
+        GtkListBoxRow *row = gtk_list_box_get_row_at_index(
+            GTK_LIST_BOX(g_palette_listbox), g_palette_selected);
+        if (row) gtk_list_box_select_row(
+            GTK_LIST_BOX(g_palette_listbox), row);
+        return TRUE;
+    }
+    if (event->keyval == GDK_KEY_Return) {
+        GtkListBoxRow *row = gtk_list_box_get_selected_row(
+            GTK_LIST_BOX(g_palette_listbox));
+        if (row) {
+            on_palette_row_activated(GTK_LIST_BOX(g_palette_listbox), row, NULL);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void
+palette_init(void)
+{
+    g_palette_window = gtk_window_new(GTK_WINDOW_POPUP);
+    gtk_window_set_transient_for(GTK_WINDOW(g_palette_window),
+        GTK_WINDOW(g_main_window));
+    gtk_window_set_modal(GTK_WINDOW(g_palette_window), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(g_palette_window), 440, 400);
+    gtk_window_set_position(GTK_WINDOW(g_palette_window),
+        GTK_WIN_POS_CENTER_ON_PARENT);
+    gtk_window_set_type_hint(GTK_WINDOW(g_palette_window),
+        GDK_WINDOW_TYPE_HINT_DIALOG);
+
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(g_palette_window), root);
+
+    g_palette_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_palette_search),
+        "Search tabs and actions...");
+    gtk_widget_set_margin_start(g_palette_search, 8);
+    gtk_widget_set_margin_end(g_palette_search, 8);
+    gtk_widget_set_margin_top(g_palette_search, 8);
+    gtk_widget_set_margin_bottom(g_palette_search, 4);
+    g_signal_connect(g_palette_search, "search-changed",
+        G_CALLBACK(on_palette_search_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(root), g_palette_search, FALSE, FALSE, 0);
+
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    g_palette_listbox = gtk_list_box_new();
+    g_signal_connect(g_palette_listbox, "row-activated",
+        G_CALLBACK(on_palette_row_activated), NULL);
+    gtk_container_add(GTK_CONTAINER(scrolled), g_palette_listbox);
+    gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
+
+    GtkWidget *footer = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(footer),
+        "<span size=\"x-small\" foreground=\"#86868b\">"
+        "↑↓ navigate  ·  Enter select  ·  Esc close</span>");
+    gtk_widget_set_margin_start(footer, 8); gtk_widget_set_margin_end(footer, 8);
+    gtk_widget_set_margin_top(footer, 4); gtk_widget_set_margin_bottom(footer, 8);
+    gtk_widget_set_halign(footer, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(root), footer, FALSE, FALSE, 0);
+
+    g_signal_connect(g_palette_window, "key-press-event",
+        G_CALLBACK(on_palette_key_press), NULL);
+
+    palette_filter(NULL);
+}
+
+static void
+palette_show(void)
+{
+    if (!g_palette_window) palette_init();
+    gtk_entry_set_text(GTK_ENTRY(g_palette_search), "");
+    palette_filter(NULL);
+    gtk_widget_show_all(g_palette_window);
+    gtk_widget_grab_focus(g_palette_search);
 }
 
 /* ────────────────────────────────────────────────────────────────────────
