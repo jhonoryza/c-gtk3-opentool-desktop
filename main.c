@@ -1543,8 +1543,8 @@ static const HomeCard g_home_cards[] = {
     {"📱", "Mimo",            "Mimo session index",          7},
     {"⚡", "Freebuff",        "Freebuff session index",      8},
     {"🔌", "Port Monitor",    "Active TCP ports",            9},
-    {"⚙️", "Config Opener",   "Edit config files",           5},
-    {"🔄", "Claude Switcher", "Switch API accounts",         6},
+    {"⚙️", "Config Opener",   "Edit config files",           6},
+    {"🔄", "Claude Switcher", "Switch API accounts",         7},
     {NULL, NULL, NULL, -1},
 };
 
@@ -3652,6 +3652,434 @@ build_terminal_tab(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+ *  Chat Web tab using webkit2gtk
+ *  Embedded browser for AI chat providers with CRUD for providers
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char *id;
+    char *name;
+    char *url;
+    int   sort_order;
+} ChatProvider;
+
+static sqlite3   *g_chat_db          = NULL;
+static GtkWidget *g_chat_list_box    = NULL;
+static GtkWidget *g_chat_webview_box = NULL;
+static WebKitWebView *g_webview      = NULL;
+static GtkWidget *g_chat_url_lbl     = NULL;
+static ChatProvider *g_active_chat   = NULL;
+
+static void
+chat_provider_free(ChatProvider *p)
+{
+    if (p == NULL) return;
+    g_free(p->id); g_free(p->name); g_free(p->url);
+    g_free(p);
+}
+
+static char *
+get_chat_db_path(void)
+{
+    char *dir = get_app_data_dir();
+    char *path = g_strdup_printf("%s/chat_providers.db", dir);
+    g_free(dir);
+    return path;
+}
+
+static int
+chat_db_init(void)
+{
+    char *dir = get_app_data_dir();
+    ensure_dir(dir);
+    g_free(dir);
+
+    char *path = get_chat_db_path();
+    int rc = sqlite3_open(path, &g_chat_db);
+    g_free(path);
+    if (rc != SQLITE_OK) {
+        if (g_chat_db) { sqlite3_close(g_chat_db); g_chat_db = NULL; }
+        return -1;
+    }
+
+    const char *schema =
+        "CREATE TABLE IF NOT EXISTS chat_providers ("
+        "  id TEXT PRIMARY KEY,"
+        "  name TEXT NOT NULL,"
+        "  url TEXT NOT NULL UNIQUE,"
+        "  sort_order INTEGER DEFAULT 0,"
+        "  created_at INTEGER,"
+        "  updated_at INTEGER"
+        ");";
+    sqlite3_exec(g_chat_db, schema, NULL, NULL, NULL);
+
+    /* Seed defaults if table is empty */
+    sqlite3_stmt *cnt = NULL;
+    int count = 0;
+    if (sqlite3_prepare_v2(g_chat_db,
+            "SELECT COUNT(*) FROM chat_providers;",
+            -1, &cnt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(cnt) == SQLITE_ROW)
+            count = sqlite3_column_int(cnt, 0);
+        sqlite3_finalize(cnt);
+    }
+    if (count == 0) {
+        static const struct { const char *name; const char *url; } defaults[] = {
+            {"DeepSeek",    "https://chat.deepseek.com/"},
+            {"Qwen",        "https://chat.qwen.ai/"},
+            {"ChatGPT",     "https://chatgpt.com/"},
+            {"AI Studio",   "https://aistudio.google.com/"},
+            {"Kimi",        "https://kimi.moonshot.cn/"},
+            {"MiniMax",     "https://chat.minimaxi.com/"},
+            {"Poe",         "https://poe.com/"},
+            {"Mistral",     "https://chat.mistral.ai/"},
+            {"Groq",        "https://chat.groq.com/"},
+            {"Grok",        "https://grok.com/"},
+            {NULL, NULL},
+        };
+        sqlite3_stmt *ins = NULL;
+        sqlite3_prepare_v2(g_chat_db,
+            "INSERT INTO chat_providers (id,name,url,sort_order,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?);", -1, &ins, NULL);
+        gint64 now = (gint64)time(NULL);
+        for (int i = 0; defaults[i].name != NULL; i++) {
+            char *uuid = ssh_new_uuid();
+            sqlite3_bind_text(ins, 1, uuid, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 2, defaults[i].name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins, 3, defaults[i].url, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int (ins, 4, i);
+            sqlite3_bind_int64(ins, 5, now);
+            sqlite3_bind_int64(ins, 6, now);
+            sqlite3_step(ins);
+            sqlite3_reset(ins);
+            g_free(uuid);
+        }
+        sqlite3_finalize(ins);
+    }
+    return 0;
+}
+
+static GPtrArray *
+chat_list_providers(void)
+{
+    GPtrArray *arr = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)chat_provider_free);
+    if (g_chat_db == NULL) return arr;
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_chat_db,
+            "SELECT id,name,url FROM chat_providers ORDER BY sort_order;",
+            -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            ChatProvider *p = g_new0(ChatProvider, 1);
+            p->id   = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+            p->name = g_strdup((const char *)sqlite3_column_text(stmt, 1));
+            p->url  = g_strdup((const char *)sqlite3_column_text(stmt, 2));
+            g_ptr_array_add(arr, p);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return arr;
+}
+
+static void
+chat_insert(const char *name, const char *url)
+{
+    if (g_chat_db == NULL) return;
+    char *uuid = ssh_new_uuid();
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(g_chat_db,
+        "INSERT INTO chat_providers (id,name,url,sort_order,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?);", -1, &stmt, NULL);
+    gint64 now = (gint64)time(NULL);
+    sqlite3_bind_text(stmt, 1, uuid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, url,  -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 4, 999);
+    sqlite3_bind_int64(stmt, 5, now);
+    sqlite3_bind_int64(stmt, 6, now);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    g_free(uuid);
+}
+
+static void
+chat_delete(const char *id)
+{
+    if (g_chat_db == NULL) return;
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(g_chat_db,
+        "DELETE FROM chat_providers WHERE id=?;", -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void refresh_chat_list(void);
+
+static void
+on_chat_web_load_changed(WebKitWebView *wv, WebKitLoadEvent event,
+                          gpointer data)
+{
+    (void)data;
+    if (g_chat_url_lbl == NULL) return;
+    const char *uri = webkit_web_view_get_uri(wv);
+    if (uri && event == WEBKIT_LOAD_COMMITTED)
+        gtk_label_set_text(GTK_LABEL(g_chat_url_lbl), uri);
+}
+
+static void
+on_chat_open_clicked(GtkButton *btn, gpointer user_data)
+{
+    ChatProvider *p = (ChatProvider *)user_data;
+    (void)btn;
+    if (g_webview == NULL) return;
+    webkit_web_view_load_uri(g_webview, p->url);
+    g_free(g_active_chat);
+    g_active_chat = g_new0(ChatProvider, 1);
+    g_active_chat->name = g_strdup(p->name);
+    g_active_chat->url  = g_strdup(p->url);
+    if (g_chat_url_lbl) gtk_label_set_text(GTK_LABEL(g_chat_url_lbl), p->url);
+    set_status("Loading %s: %s", p->name, p->url);
+}
+
+static void
+on_chat_delete_clicked(GtkButton *btn, gpointer user_data)
+{
+    ChatProvider *p = (ChatProvider *)user_data;
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(g_main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+        "Delete chat provider '%s'?", p->name);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_YES) {
+        chat_delete(p->id);
+        refresh_chat_list();
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static GtkWidget *
+create_chat_row(ChatProvider *p)
+{
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox,   12);
+    gtk_widget_set_margin_end(hbox,     8);
+    gtk_widget_set_margin_top(hbox,     4);
+    gtk_widget_set_margin_bottom(hbox,  4);
+
+    GtkWidget *name_lbl = gtk_label_new(p->name);
+    gtk_widget_set_hexpand(name_lbl, TRUE);
+    gtk_widget_set_halign(name_lbl, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(name_lbl), "account-name");
+    gtk_box_pack_start(GTK_BOX(hbox), name_lbl, TRUE, TRUE, 0);
+
+    GtkWidget *url_lbl = gtk_label_new(p->url);
+    gtk_widget_set_halign(url_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(url_lbl), PANGO_ELLIPSIZE_END);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(url_lbl), "account-meta");
+    gtk_box_pack_start(GTK_BOX(hbox), url_lbl, TRUE, TRUE, 0);
+
+    GtkWidget *open_btn = gtk_button_new_with_label("Open");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(open_btn), "open-button");
+    g_signal_connect(open_btn, "clicked",
+        G_CALLBACK(on_chat_open_clicked), p);
+    gtk_box_pack_start(GTK_BOX(hbox), open_btn, FALSE, FALSE, 0);
+
+    GtkWidget *del_btn = gtk_button_new_with_label("Delete");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(del_btn), "delete-button");
+    g_signal_connect(del_btn, "clicked",
+        G_CALLBACK(on_chat_delete_clicked), p);
+    gtk_box_pack_start(GTK_BOX(hbox), del_btn, FALSE, FALSE, 0);
+
+    return hbox;
+}
+
+static void
+on_chat_add_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Add Chat Provider",
+        GTK_WINDOW(g_main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save",   GTK_RESPONSE_ACCEPT, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 440, 180);
+    install_shortcuts(dialog);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 18);
+    gtk_box_pack_start(GTK_BOX(content), grid, TRUE, TRUE, 0);
+
+    GtkWidget *en_name = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(en_name), "e.g. ChatGPT");
+    GtkWidget *en_url = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(en_url), "https://chatgpt.com/");
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Name"), 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), en_name, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("URL"),  0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), en_url,  1, 1, 1, 1);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        const char *n = gtk_entry_get_text(GTK_ENTRY(en_name));
+        const char *u = gtk_entry_get_text(GTK_ENTRY(en_url));
+        if (n && *n && u && *u) {
+            chat_insert(n, u);
+            refresh_chat_list();
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void
+refresh_chat_list(void)
+{
+    if (g_chat_list_box == NULL) return;
+
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_chat_list_box));
+    for (GList *l = kids; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    GPtrArray *providers = chat_list_providers();
+    if (providers->len == 0) {
+        GtkWidget *r = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
+        GtkWidget *e = gtk_label_new("No chat providers. Add one to get started.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_chat_list_box), r);
+    } else {
+        for (guint i = 0; i < providers->len; i++) {
+            ChatProvider *p = g_ptr_array_index(providers, i);
+            g_ptr_array_index(providers, i) = NULL;
+            GtkWidget *r = gtk_list_box_row_new();
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_container_add(GTK_CONTAINER(r), create_chat_row(p));
+            gtk_container_add(GTK_CONTAINER(g_chat_list_box), r);
+            g_object_set_data_full(G_OBJECT(r), "cp", p,
+                (GDestroyNotify)chat_provider_free);
+        }
+    }
+    g_ptr_array_free(providers, TRUE);
+    gtk_widget_show_all(g_chat_list_box);
+}
+
+static void
+on_chat_back_clicked(GtkButton *btn, gpointer data)
+{ if (g_webview && webkit_web_view_can_go_back(g_webview))
+      webkit_web_view_go_back(g_webview); }
+
+static void
+on_chat_fwd_clicked(GtkButton *btn, gpointer data)
+{ if (g_webview && webkit_web_view_can_go_forward(g_webview))
+      webkit_web_view_go_forward(g_webview); }
+
+static void
+on_chat_reload_clicked(GtkButton *btn, gpointer data)
+{ if (g_webview) webkit_web_view_reload(g_webview); }
+
+static GtkWidget *
+build_chat_web_tab(void)
+{
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    /* Top nav bar */
+    GtkWidget *nav = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(nav), "header-box");
+    gtk_widget_set_margin_start(nav, 4); gtk_widget_set_margin_end(nav, 4);
+    gtk_widget_set_margin_top(nav, 4); gtk_widget_set_margin_bottom(nav, 4);
+
+    GtkWidget *back_btn = gtk_button_new_with_label("<");
+    gtk_style_context_add_class(gtk_widget_get_style_context(back_btn), "edit-button");
+    g_signal_connect(back_btn, "clicked", G_CALLBACK(on_chat_back_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(nav), back_btn, FALSE, FALSE, 0);
+
+    GtkWidget *fwd_btn = gtk_button_new_with_label(">");
+    gtk_style_context_add_class(gtk_widget_get_style_context(fwd_btn), "edit-button");
+    g_signal_connect(fwd_btn, "clicked", G_CALLBACK(on_chat_fwd_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(nav), fwd_btn, FALSE, FALSE, 0);
+
+    GtkWidget *reload_btn = gtk_button_new_with_label("Reload");
+    gtk_style_context_add_class(gtk_widget_get_style_context(reload_btn), "edit-button");
+    g_signal_connect(reload_btn, "clicked", G_CALLBACK(on_chat_reload_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(nav), reload_btn, FALSE, FALSE, 0);
+
+    g_chat_url_lbl = gtk_label_new("Select a chat provider to load");
+    gtk_widget_set_hexpand(g_chat_url_lbl, TRUE);
+    gtk_widget_set_halign(g_chat_url_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(g_chat_url_lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(g_chat_url_lbl), "account-meta");
+    gtk_box_pack_start(GTK_BOX(nav), g_chat_url_lbl, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(root), nav, FALSE, FALSE, 0);
+
+    /* Split view: sidebar (providers) + webview */
+    GtkWidget *paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(root), paned, TRUE, TRUE, 0);
+
+    /* Sidebar: providers list */
+    GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(sidebar, 240, -1);
+
+    GtkWidget *sidebar_hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_start(sidebar_hdr, 8);
+    gtk_widget_set_margin_end(sidebar_hdr, 8);
+    gtk_widget_set_margin_top(sidebar_hdr, 8);
+    gtk_widget_set_margin_bottom(sidebar_hdr, 4);
+
+    GtkWidget *add_btn = gtk_button_new_with_label("+ Add Provider");
+    gtk_style_context_add_class(gtk_widget_get_style_context(add_btn), "add-button");
+    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_chat_add_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(sidebar_hdr), add_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sidebar), sidebar_hdr, FALSE, FALSE, 0);
+
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    g_chat_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_chat_list_box), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(scrolled), g_chat_list_box);
+    gtk_box_pack_start(GTK_BOX(sidebar), scrolled, TRUE, TRUE, 0);
+
+    gtk_paned_pack1(GTK_PANED(paned), sidebar, FALSE, FALSE);
+
+    /* Web view */
+    g_chat_webview_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    g_webview = WEBKIT_WEB_VIEW(webkit_web_view_new());
+    WebKitSettings *settings = webkit_web_view_get_settings(g_webview);
+    webkit_settings_set_javascript_enabled(settings, TRUE);
+    webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
+    webkit_settings_set_enable_developer_extras(settings, TRUE);
+
+    g_signal_connect(g_webview, "load-changed",
+        G_CALLBACK(on_chat_web_load_changed), NULL);
+
+    gtk_box_pack_start(GTK_BOX(g_chat_webview_box),
+        GTK_WIDGET(g_webview), TRUE, TRUE, 0);
+
+    gtk_paned_pack2(GTK_PANED(paned), g_chat_webview_box, TRUE, FALSE);
+
+    chat_db_init();
+    refresh_chat_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  *  Config Opener tab (tab 1) — dynamic, SQLite-backed
  * ──────────────────────────────────────────────────────────────────────── */
 
@@ -4844,6 +5272,10 @@ main(int argc, char *argv[])
     GtkWidget *tab_term = build_terminal_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_term,
         gtk_label_new("Terminal"));
+
+    GtkWidget *tab_chat = build_chat_web_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_chat,
+        gtk_label_new("Chat Web"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
