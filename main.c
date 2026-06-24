@@ -1,18 +1,20 @@
 /**
- * main.c — Config Opener + Claude Switcher
+ * main.c -- Opentool Desktop
  *
- * A GTK3 desktop application (pure C, C99/C11) for macOS with two tabs:
- *   1. Config Opener  — list configuration files and open them with Sublime Text
- *   2. Claude Switcher — manage Claude API accounts (name / api key / base url)
- *      stored in SQLite, with "activate" that rewrites ~/.claude/settings.json.
+ * A GTK3 desktop application (pure C, C11) for Linux with tabs:
+ *   Home, OpenCode, Claude, SSH, Terminal, Chat Web, Kimchi, Mimo,
+ *   Freebuff, Port Monitor, Config Opener, Claude Switcher, Command Palette.
  *
  * Compile:
- *   gcc -std=c99 -Wall -Wextra -o config-opener main.c \
- *       $(pkg-config --cflags --libs gtk+-3.0 sqlite3)
+ *   make
+ *   gcc -std=c11 -Wall -Wextra -o opentool main.c \
+ *       $(pkg-config --cflags --libs gtk+-3.0 sqlite3 vte-2.91 webkit2gtk-4.1)
  */
 
 #include <gtk/gtk.h>
 #include <sqlite3.h>
+#include <vte/vte.h>
+#include <webkit2/webkit2.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,11 +23,10 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/inotify.h>
 #include <time.h>
-
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#endif
+#include <dirent.h>
+#include <fcntl.h>
 
 /* ────────────────────────────────────────────────────────────────────────
  *  Domain types
@@ -417,21 +418,22 @@ expand_path(const char *path_template)
 static char *
 get_dynamic_user_path(void)
 {
-    const char *user = g_get_user_name();
-    if (user == NULL)
-        user = "fajar";
-
+    const char *home = g_get_home_dir();
+    if (home == NULL) home = "/tmp";
     return g_strdup_printf(
-        "/Users/%s/Library/Application Support/gowails-chatai-desktop/settings.json",
-        user);
+        "%s/.config/gowails-chatai-desktop/settings.json",
+        home);
 }
 
 static char *
 get_app_data_dir(void)
 {
+    const char *xdg = g_getenv("XDG_DATA_HOME");
+    if (xdg != NULL && *xdg != '\0')
+        return g_strdup_printf("%s/opentool", xdg);
     const char *home = g_get_home_dir();
     if (home == NULL) home = "/tmp";
-    return g_strdup_printf("%s/Library/Application Support/config-opener", home);
+    return g_strdup_printf("%s/.local/share/opentool", home);
 }
 
 static char *
@@ -463,42 +465,26 @@ get_claude_settings_backup_path(void)
 static char *
 get_exe_dir(void)
 {
-#ifdef __APPLE__
-    uint32_t size = 0;
-    _NSGetExecutablePath(NULL, &size);
-    if (size == 0) return NULL;
-    char *buf = g_malloc(size + 1);
-    if (_NSGetExecutablePath(buf, &size) != 0) {
-        g_free(buf);
-        return NULL;
-    }
-    buf[size] = 0;
-    char *dir = g_path_get_dirname(buf);
-    g_free(buf);
-    return dir;
-#else
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return NULL;
     buf[n] = 0;
     return g_path_get_dirname(buf);
-#endif
 }
 
-/* Search for logo-512.png in: same dir as exe, .app Resources, share dirs.
+/* Search for logo-512.png in: same dir as exe, share dirs.
  * Set as default icon so every GtkWindow picks it up automatically. */
 static void
 setup_app_icon(void)
 {
     static const char *const rel_candidates[] = {
         "logo-512.png",
-        "../Resources/logo-512.png",
-        "../share/config-opener/logo-512.png",
+        "../share/opentool/logo-512.png",
         NULL,
     };
     static const char *const abs_candidates[] = {
-        "/usr/local/share/config-opener/logo-512.png",
-        "/usr/share/config-opener/logo-512.png",
+        "/usr/local/share/opentool/logo-512.png",
+        "/usr/share/opentool/logo-512.png",
         NULL,
     };
 
@@ -582,18 +568,29 @@ command_exists(const char *cmd)
     return found;
 }
 
-static void
-launch_sublime(GtkWidget *parent, const char *path)
+static const char *
+get_editor(void)
 {
-    if (!command_exists("subl")) {
+    const char *editor = g_getenv("EDITOR");
+    if (editor != NULL && *editor != '\0') return editor;
+    if (command_exists("xdg-open")) return "xdg-open";
+    if (command_exists("gedit"))    return "gedit";
+    if (command_exists("nano"))     return "nano";
+    return NULL;
+}
+
+static void
+launch_editor(GtkWidget *parent, const char *path)
+{
+    const char *editor = get_editor();
+    if (editor == NULL) {
         GtkWidget *dialog = gtk_message_dialog_new(
             GTK_WINDOW(gtk_widget_get_toplevel(parent)),
             GTK_DIALOG_DESTROY_WITH_PARENT,
             GTK_MESSAGE_ERROR,
             GTK_BUTTONS_OK,
-            "Command 'subl' not found.\n\n"
-            "Install: ln -s /Applications/Sublime\\ Text.app/Contents/SharedSupport/"
-            "bin/subl /usr/local/bin/subl");
+            "No editor found.\n\n"
+            "Set the $EDITOR environment variable or install xdg-open.");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return;
@@ -601,9 +598,9 @@ launch_sublime(GtkWidget *parent, const char *path)
 
     pid_t pid = fork();
     if (pid == 0) {
-        execlp("subl", "subl", path, (char *)NULL);
-        fprintf(stderr, "[config-opener] exec subl failed for '%s': %s\n",
-                path, strerror(errno));
+        execlp(editor, editor, path, (char *)NULL);
+        fprintf(stderr, "[opentool] exec %s failed for '%s': %s\n",
+                editor, path, strerror(errno));
         _exit(1);
     } else if (pid < 0) {
         GtkWidget *dialog = gtk_message_dialog_new(
@@ -611,7 +608,7 @@ launch_sublime(GtkWidget *parent, const char *path)
             GTK_DIALOG_DESTROY_WITH_PARENT,
             GTK_MESSAGE_ERROR,
             GTK_BUTTONS_OK,
-            "Failed to launch Sublime Text:\n%s",
+            "Failed to launch editor:\n%s",
             strerror(errno));
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
@@ -650,12 +647,10 @@ set_status(const char *fmt, ...)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
- *  macOS clipboard shortcuts
+ *  Keyboard shortcuts
  *
- *  GTK3 on macOS doesn't translate the Cmd key into Ctrl, so Cmd+C / V / X /
- *  A don't work in entries out of the box.  We install a window-level
- *  key-press hook that catches Cmd modifier (META / MOD2 / SUPER) and emits
- *  the matching clipboard signal on the focused widget.
+ *  Ctrl+W closes current window (or Ctrl+Q quits app).
+ *  Ctrl+P opens command palette (handled in main).
  * ──────────────────────────────────────────────────────────────────────── */
 
 static gboolean
@@ -663,68 +658,26 @@ on_window_key_press(GtkWidget *window, GdkEventKey *event, gpointer data)
 {
     (void)data;
 
-    const guint cmd_mask = GDK_META_MASK | GDK_MOD2_MASK | GDK_SUPER_MASK;
-    if (!(event->state & cmd_mask))
-        return FALSE;
-
-    GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(window));
-    if (focus == NULL)
+    guint mask = gtk_accelerator_get_default_mod_mask();
+    if (!(event->state & GDK_CONTROL_MASK))
         return FALSE;
 
     guint key = gdk_keyval_to_lower(event->keyval);
 
-    /* Cmd+W closes the current window. */
-    if (key == GDK_KEY_w) {
+    if (key == GDK_KEY_w && (mask & GDK_CONTROL_MASK) == GDK_CONTROL_MASK) {
         gtk_window_close(GTK_WINDOW(window));
         return TRUE;
     }
-    /* Cmd+Q quits the application. */
-    if (key == GDK_KEY_q) {
+    if (key == GDK_KEY_q && (mask & GDK_CONTROL_MASK) == GDK_CONTROL_MASK) {
         gtk_main_quit();
         return TRUE;
     }
 
-    /* Editing operations only make sense on text widgets. */
-    if (!GTK_IS_EDITABLE(focus) && !GTK_IS_TEXT_VIEW(focus))
-        return FALSE;
-
-    switch (key) {
-        case GDK_KEY_c:
-            if (g_signal_lookup("copy-clipboard", G_OBJECT_TYPE(focus))) {
-                g_signal_emit_by_name(focus, "copy-clipboard");
-                return TRUE;
-            }
-            break;
-        case GDK_KEY_v:
-            if (g_signal_lookup("paste-clipboard", G_OBJECT_TYPE(focus))) {
-                g_signal_emit_by_name(focus, "paste-clipboard");
-                return TRUE;
-            }
-            break;
-        case GDK_KEY_x:
-            if (g_signal_lookup("cut-clipboard", G_OBJECT_TYPE(focus))) {
-                g_signal_emit_by_name(focus, "cut-clipboard");
-                return TRUE;
-            }
-            break;
-        case GDK_KEY_a:
-            if (GTK_IS_EDITABLE(focus)) {
-                gtk_editable_select_region(GTK_EDITABLE(focus), 0, -1);
-                return TRUE;
-            }
-            if (GTK_IS_TEXT_VIEW(focus)) {
-                g_signal_emit_by_name(focus, "select-all", TRUE);
-                return TRUE;
-            }
-            break;
-        default:
-            break;
-    }
     return FALSE;
 }
 
 static void
-install_mac_shortcuts(GtkWidget *window)
+install_shortcuts(GtkWidget *window)
 {
     g_signal_connect(window, "key-press-event",
                      G_CALLBACK(on_window_key_press), NULL);
@@ -1544,7 +1497,7 @@ run_config_dialog(GtkWindow *parent, ConfigForm *form)
         NULL);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 580, 220);
     gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
-    install_mac_shortcuts(dialog);
+    install_shortcuts(dialog);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget *grid = gtk_grid_new();
@@ -1621,12 +1574,12 @@ on_config_open_clicked(GtkButton *button, gpointer user_data)
             GTK_MESSAGE_WARNING,
             GTK_BUTTONS_OK,
             "File not found:\n%s\n\n"
-            "Sublime Text may create a new file or show an error.",
+            "The editor may create a new file or show an error.",
             full_path);
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
     }
-    launch_sublime(GTK_WIDGET(button), full_path);
+    launch_editor(GTK_WIDGET(button), full_path);
     g_free(full_path);
 }
 
@@ -1746,7 +1699,7 @@ create_config_row(ConfigEntry *c)
                      G_CALLBACK(on_config_delete_clicked), c);
     gtk_box_pack_start(GTK_BOX(hbox), del_btn, FALSE, FALSE, 0);
 
-    GtkWidget *open_btn = gtk_button_new_with_label("Open in Sublime Text");
+    GtkWidget *open_btn = gtk_button_new_with_label("Open");
     gtk_style_context_add_class(
         gtk_widget_get_style_context(open_btn), "open-button");
     g_signal_connect(open_btn, "clicked",
@@ -1827,7 +1780,7 @@ build_config_opener_tab(void)
     gtk_box_pack_start(GTK_BOX(header_text), title, FALSE, FALSE, 0);
 
     GtkWidget *subtitle = gtk_label_new(
-        "Manage config file shortcuts  ·  open them with Sublime Text");
+        "Manage config file shortcuts  ·  open them with $EDITOR");
     gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
     gtk_style_context_add_class(
         gtk_widget_get_style_context(subtitle), "subtitle-label");
@@ -1886,7 +1839,7 @@ run_account_dialog(GtkWindow *parent, AccountForm *form)
         NULL);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 560, 260);
     gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
-    install_mac_shortcuts(dialog);
+    install_shortcuts(dialog);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget *grid = gtk_grid_new();
@@ -1911,7 +1864,7 @@ run_account_dialog(GtkWindow *parent, AccountForm *form)
     gtk_widget_set_hexpand(en_key, TRUE);
     gtk_entry_set_activates_default(GTK_ENTRY(en_key), TRUE);
     gtk_entry_set_placeholder_text(GTK_ENTRY(en_key),
-                                   "paste with Cmd+V");
+                                    "paste with Ctrl+V");
     if (form->api_key) gtk_entry_set_text(GTK_ENTRY(en_key), form->api_key);
     gtk_grid_attach(GTK_GRID(grid), lab_key, 0, 1, 1, 1);
     gtk_grid_attach(GTK_GRID(grid), en_key,  1, 1, 1, 1);
@@ -1930,7 +1883,7 @@ run_account_dialog(GtkWindow *parent, AccountForm *form)
     GtkWidget *hint = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(hint),
         "<span size=\"x-small\" foreground=\"#86868b\">"
-        "Cmd+C / V / X / A work in these fields.  Press Enter to save."
+        "Ctrl+C / V / X / A work in these fields.  Press Enter to save."
         "</span>");
     gtk_widget_set_halign(hint, GTK_ALIGN_START);
     gtk_grid_attach(GTK_GRID(grid), hint, 1, 3, 1, 1);
@@ -2087,7 +2040,7 @@ on_open_account_clicked(GtkButton *button, gpointer user_data)
 {
     Account *a = (Account *)user_data;
     char *path = write_preview_json(a);
-    launch_sublime(GTK_WIDGET(button), path);
+    launch_editor(GTK_WIDGET(button), path);
     g_free(path);
 }
 
@@ -2160,12 +2113,12 @@ create_account_row(Account *a)
                      G_CALLBACK(on_delete_clicked), a);
     gtk_box_pack_start(GTK_BOX(hbox), del_btn, FALSE, FALSE, 0);
 
-    GtkWidget *open_btn = gtk_button_new_with_label("Open in Sublime");
+    GtkWidget *open_btn = gtk_button_new_with_label("Open");
     gtk_style_context_add_class(
         gtk_widget_get_style_context(open_btn), "open-button");
     gtk_widget_set_tooltip_text(open_btn,
         "Write this account's settings.json preview to disk and open it in "
-        "Sublime Text (does not activate).");
+        "the default editor (does not activate).");
     g_signal_connect(open_btn, "clicked",
                      G_CALLBACK(on_open_account_clicked), a);
     gtk_box_pack_start(GTK_BOX(hbox), open_btn, FALSE, FALSE, 0);
@@ -2364,7 +2317,7 @@ on_plugins_clicked(GtkButton *button, gpointer user_data)
         NULL);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 560, 440);
     gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CLOSE);
-    install_mac_shortcuts(dialog);
+    install_shortcuts(dialog);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     gtk_container_set_border_width(GTK_CONTAINER(content), 12);
@@ -2677,10 +2630,10 @@ main(int argc, char *argv[])
     GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     g_main_window = window;
     gtk_window_set_title(GTK_WINDOW(window),
-                         "Config Opener — Sublime Text Launcher");
+                         "Opentool Desktop");
     gtk_window_set_default_size(GTK_WINDOW(window), 720, 460);
     g_signal_connect(window, "destroy", G_CALLBACK(on_destroy), NULL);
-    install_mac_shortcuts(window);
+    install_shortcuts(window);
 
     /* Root vbox */
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
