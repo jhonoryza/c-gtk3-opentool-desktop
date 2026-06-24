@@ -1543,8 +1543,8 @@ static const HomeCard g_home_cards[] = {
     {"📱", "Mimo",            "Mimo session index",          7},
     {"⚡", "Freebuff",        "Freebuff session index",      8},
     {"🔌", "Port Monitor",    "Active TCP ports",            9},
-    {"⚙️", "Config Opener",   "Edit config files",           3},
-    {"🔄", "Claude Switcher", "Switch API accounts",         4},
+    {"⚙️", "Config Opener",   "Edit config files",           4},
+    {"🔄", "Claude Switcher", "Switch API accounts",         5},
     {NULL, NULL, NULL, -1},
 };
 
@@ -2771,6 +2771,657 @@ build_claude_tab(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+ *  SSH Connection Manager tab
+ *  CRUD for SSH connections, import from ~/.ssh/config, grouped display
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char *id;
+    char *name;
+    char *host;
+    int   port;
+    char *user;
+    char *auth_type;
+    char *credential;
+    char *group_name;
+    long  created_at;
+    long  updated_at;
+} SSHConn;
+
+static sqlite3   *g_ssh_db          = NULL;
+static GtkWidget *g_ssh_list_box    = NULL;
+static GtkWidget *g_ssh_count_lbl   = NULL;
+static GtkWidget *g_ssh_search      = NULL;
+
+static void
+ssh_conn_free(SSHConn *c)
+{
+    if (c == NULL) return;
+    g_free(c->id); g_free(c->name); g_free(c->host);
+    g_free(c->user); g_free(c->auth_type); g_free(c->credential);
+    g_free(c->group_name);
+    g_free(c);
+}
+
+static char *
+get_ssh_db_path(void)
+{
+    char *dir = get_app_data_dir();
+    char *path = g_strdup_printf("%s/ssh.db", dir);
+    g_free(dir);
+    return path;
+}
+
+static int
+ssh_db_init(void)
+{
+    char *dir = get_app_data_dir();
+    ensure_dir(dir);
+    g_free(dir);
+
+    char *path = get_ssh_db_path();
+    int rc = sqlite3_open(path, &g_ssh_db);
+    g_free(path);
+    if (rc != SQLITE_OK) {
+        if (g_ssh_db) { sqlite3_close(g_ssh_db); g_ssh_db = NULL; }
+        return -1;
+    }
+
+    const char *schema =
+        "CREATE TABLE IF NOT EXISTS ssh_connections ("
+        "  id TEXT PRIMARY KEY,"
+        "  name TEXT NOT NULL,"
+        "  host TEXT NOT NULL,"
+        "  port INTEGER DEFAULT 22,"
+        "  user TEXT NOT NULL,"
+        "  auth_type TEXT DEFAULT 'key',"
+        "  credential TEXT DEFAULT '',"
+        "  group_name TEXT DEFAULT '',"
+        "  created_at INTEGER NOT NULL,"
+        "  updated_at INTEGER NOT NULL"
+        ");";
+    sqlite3_exec(g_ssh_db, schema, NULL, NULL, NULL);
+    return 0;
+}
+
+static char *
+ssh_new_uuid(void)
+{
+    static unsigned int seed = 0;
+    if (seed == 0) seed = (unsigned int)time(NULL);
+    unsigned r1 = rand_r(&seed);
+    unsigned r2 = rand_r(&seed);
+    return g_strdup_printf("%08x-%04x-%04x-%04x-%012x%08x",
+        r1, r2 >> 8, (r2 & 0xFF) | 0x40, (r1 >> 4) & 0x3FFF | 0x8000,
+        (unsigned)time(NULL), r1 ^ r2);
+}
+
+static GPtrArray *
+ssh_list_connections(const char *search)
+{
+    GPtrArray *arr = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)ssh_conn_free);
+    if (g_ssh_db == NULL) return arr;
+
+    const char *base_sql =
+        "SELECT id, name, host, port, user, auth_type, credential, "
+        "group_name, created_at, updated_at FROM ssh_connections";
+    char sql[2048];
+    if (search != NULL && *search != '\0') {
+        char *esc = g_strescape(search, NULL);
+        snprintf(sql, sizeof(sql),
+            "%s WHERE name LIKE '%%%s%%' OR host LIKE '%%%s%%' "
+            "OR user LIKE '%%%s%%' OR group_name LIKE '%%%s%%' "
+            "ORDER BY group_name, updated_at DESC;",
+            base_sql, esc, esc, esc, esc);
+        g_free(esc);
+    } else {
+        snprintf(sql, sizeof(sql),
+            "%s ORDER BY group_name, updated_at DESC;", base_sql);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_ssh_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            SSHConn *c = g_new0(SSHConn, 1);
+            c->id         = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+            c->name       = g_strdup((const char *)sqlite3_column_text(stmt, 1));
+            c->host       = g_strdup((const char *)sqlite3_column_text(stmt, 2));
+            c->port       = sqlite3_column_int(stmt, 3);
+            c->user       = g_strdup((const char *)sqlite3_column_text(stmt, 4));
+            c->auth_type  = g_strdup((const char *)sqlite3_column_text(stmt, 5));
+            c->credential = g_strdup((const char *)sqlite3_column_text(stmt, 6));
+            c->group_name = g_strdup((const char *)sqlite3_column_text(stmt, 7));
+            c->created_at = sqlite3_column_int64(stmt, 8);
+            c->updated_at = sqlite3_column_int64(stmt, 9);
+            g_ptr_array_add(arr, c);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return arr;
+}
+
+static int
+ssh_insert(SSHConn *c, char **err_out)
+{
+    if (g_ssh_db == NULL) return -1;
+    const char *sql =
+        "INSERT INTO ssh_connections (id,name,host,port,user,auth_type,"
+        "credential,group_name,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_ssh_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        if (err_out) *err_out = g_strdup(sqlite3_errmsg(g_ssh_db));
+        return -1;
+    }
+    gint64 now = (gint64)time(NULL);
+    sqlite3_bind_text(stmt, 1, c->id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, c->name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, c->host, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 4, c->port);
+    sqlite3_bind_text(stmt, 5, c->user, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, c->auth_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, c->credential, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, c->group_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 9, now);
+    sqlite3_bind_int64(stmt,10, now);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE && err_out)
+        *err_out = g_strdup(sqlite3_errmsg(g_ssh_db));
+    return 0;
+}
+
+static int
+ssh_update(SSHConn *c, char **err_out)
+{
+    if (g_ssh_db == NULL) return -1;
+    const char *sql =
+        "UPDATE ssh_connections SET name=?,host=?,port=?,user=?,auth_type=?,"
+        "credential=?,group_name=?,updated_at=? WHERE id=?;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_ssh_db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(stmt, 1, c->name,      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, c->host,      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int (stmt, 3, c->port);
+    sqlite3_bind_text(stmt, 4, c->user,      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, c->auth_type, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, c->credential,-1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, c->group_name,-1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 8, (gint64)time(NULL));
+    sqlite3_bind_text(stmt, 9, c->id,        -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE && err_out) *err_out = g_strdup(sqlite3_errmsg(g_ssh_db));
+    return 0;
+}
+
+static int
+ssh_delete(const char *id)
+{
+    if (g_ssh_db == NULL) return -1;
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(g_ssh_db,
+        "DELETE FROM ssh_connections WHERE id=?;", -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return 0;
+}
+
+/* Parse ~/.ssh/config and import Host entries */
+static void
+ssh_import_config(void)
+{
+    const char *home = g_get_home_dir();
+    if (home == NULL) return;
+    char *cfg_path = g_build_filename(home, ".ssh", "config", NULL);
+
+    gchar *data = NULL;
+    gsize len = 0;
+    if (!g_file_get_contents(cfg_path, &data, &len, NULL)) {
+        g_free(cfg_path);
+        return;
+    }
+
+    gchar **lines = g_strsplit(data, "\n", -1);
+    g_free(data);
+
+    char *cur_host = NULL, *cur_hostname = NULL, *cur_user = NULL;
+    int   cur_port = 22;
+    char *cur_key  = NULL;
+    int   imported = 0;
+
+    for (int i = 0; lines[i] != NULL; i++) {
+        char *line = lines[i];
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '#' || *line == '\0') continue;
+
+        char *space = strchr(line, ' ');
+        if (space == NULL) continue;
+        *space = '\0';
+        char *key = line, *val = space + 1;
+        while (*val == ' ') val++;
+
+        gboolean is_host = g_ascii_strcasecmp(key, "Host") == 0;
+        if (is_host && cur_host != NULL && strcmp(cur_host, "*") != 0) {
+            SSHConn c = {
+                .id         = ssh_new_uuid(),
+                .name       = g_strdup(cur_host),
+                .host       = g_strdup(cur_hostname ? cur_hostname : cur_host),
+                .port       = cur_port,
+                .user       = g_strdup(cur_user ? cur_user : ""),
+                .auth_type  = g_strdup("key"),
+                .credential = g_strdup(cur_key ? cur_key : ""),
+                .group_name = g_strdup(""),
+            };
+            ssh_insert(&c, NULL);
+            ssh_conn_free(&c);
+            imported++;
+        }
+
+        if (is_host) {
+            g_free(cur_host); cur_host = g_strdup(val);
+            g_free(cur_hostname); cur_hostname = NULL;
+            g_free(cur_user); cur_user = NULL;
+            cur_port = 22;
+            g_free(cur_key); cur_key = NULL;
+        } else if (g_ascii_strcasecmp(key, "HostName") == 0 ||
+                   g_ascii_strcasecmp(key, "Hostname") == 0) {
+            g_free(cur_hostname); cur_hostname = g_strdup(val);
+        } else if (g_ascii_strcasecmp(key, "User") == 0) {
+            g_free(cur_user); cur_user = g_strdup(val);
+        } else if (g_ascii_strcasecmp(key, "Port") == 0) {
+            cur_port = atoi(val);
+        } else if (g_ascii_strcasecmp(key, "IdentityFile") == 0) {
+            if (*val == '~') {
+                g_free(cur_key);
+                cur_key = g_build_filename(home, val + 1);
+            } else {
+                g_free(cur_key); cur_key = g_strdup(val);
+            }
+        }
+    }
+
+    if (cur_host != NULL && strcmp(cur_host, "*") != 0) {
+        SSHConn c = {
+            .id         = ssh_new_uuid(),
+            .name       = g_strdup(cur_host),
+            .host       = g_strdup(cur_hostname ? cur_hostname : cur_host),
+            .port       = cur_port,
+            .user       = g_strdup(cur_user ? cur_user : ""),
+            .auth_type  = g_strdup("key"),
+            .credential = g_strdup(cur_key ? cur_key : ""),
+            .group_name = g_strdup(""),
+        };
+        ssh_insert(&c, NULL);
+        ssh_conn_free(&c);
+        imported++;
+    }
+
+    g_free(cur_host); g_free(cur_hostname); g_free(cur_user); g_free(cur_key);
+    g_strfreev(lines);
+    g_free(cfg_path);
+    set_status("✓ Imported %d SSH connections from ~/.ssh/config", imported);
+}
+
+static void refresh_ssh_list(void);
+
+typedef struct {
+    int    is_new;
+    char  *id;
+    char  *name;
+    char  *host;
+    int    port;
+    char  *user;
+    char  *auth_type;
+    char  *credential;
+    char  *group_name;
+} SSHForm;
+
+static gboolean
+run_ssh_dialog(GtkWindow *parent, SSHForm *form)
+{
+    const char *title = form->is_new ? "Add SSH Connection" : "Edit SSH Connection";
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        title, parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 540, 380);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+    install_shortcuts(dialog);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 18);
+    gtk_box_pack_start(GTK_BOX(content), grid, TRUE, TRUE, 0);
+
+    GtkWidget *en_name = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(en_name), "Connection name");
+    if (form->name) gtk_entry_set_text(GTK_ENTRY(en_name), form->name);
+
+    GtkWidget *en_host = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(en_host), "hostname or IP");
+    if (form->host) gtk_entry_set_text(GTK_ENTRY(en_host), form->host);
+
+    GtkWidget *en_user = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(en_user), "username");
+    if (form->user) gtk_entry_set_text(GTK_ENTRY(en_user), form->user);
+
+    GtkWidget *en_port = gtk_spin_button_new_with_range(1, 65535, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(en_port), form->port);
+
+    GtkWidget *en_group = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(en_group), "optional group");
+    if (form->group_name) gtk_entry_set_text(GTK_ENTRY(en_group), form->group_name);
+
+    const char *items[] = {"key", "password", NULL};
+    GtkWidget *cmb_auth = gtk_combo_box_text_new();
+    for (int i = 0; items[i] != NULL; i++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(cmb_auth), items[i]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(cmb_auth), 0);
+
+    GtkWidget *lbl_fields[] = {
+        gtk_label_new("Name"), gtk_label_new("Host"), gtk_label_new("User"),
+        gtk_label_new("Port"), gtk_label_new("Group"),
+        gtk_label_new("Auth Type"),
+    };
+    GtkWidget *inputs[] = {en_name, en_host, en_user, en_port, en_group, cmb_auth};
+    for (int i = 0; i < 6; i++) {
+        gtk_widget_set_halign(lbl_fields[i], GTK_ALIGN_END);
+        gtk_widget_set_hexpand(inputs[i], TRUE);
+        gtk_grid_attach(GTK_GRID(grid), lbl_fields[i], 0, i, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), inputs[i],     1, i, 1, 1);
+    }
+
+    gtk_widget_show_all(dialog);
+    gboolean saved = FALSE;
+    while (TRUE) {
+        if (gtk_dialog_run(GTK_DIALOG(dialog)) != GTK_RESPONSE_ACCEPT) break;
+        const char *n = gtk_entry_get_text(GTK_ENTRY(en_name));
+        const char *h = gtk_entry_get_text(GTK_ENTRY(en_host));
+        const char *u = gtk_entry_get_text(GTK_ENTRY(en_user));
+        if (n == NULL || *n == '\0' || h == NULL || *h == '\0') {
+            show_error(dialog, "Name and Host are required.");
+            continue;
+        }
+        g_free(form->name); form->name = g_strdup(n);
+        g_free(form->host); form->host = g_strdup(h);
+        g_free(form->user); form->user = g_strdup(u && *u ? u : "root");
+        form->port = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(en_port));
+        g_free(form->group_name); form->group_name = g_strdup(gtk_entry_get_text(GTK_ENTRY(en_group)));
+        g_free(form->auth_type);  form->auth_type  = g_strdup(gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(cmb_auth)));
+        saved = TRUE;
+        break;
+    }
+    gtk_widget_destroy(dialog);
+    return saved;
+}
+
+static void
+on_ssh_connect_clicked(GtkButton *btn, gpointer user_data)
+{
+    SSHConn *c = (SSHConn *)user_data;
+    (void)btn;
+    char port_str[8]; snprintf(port_str, sizeof(port_str), "%d", c->port);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (c->credential && *c->credential && g_strcmp0(c->auth_type, "key") == 0)
+            execlp("ssh", "ssh", "-p", port_str, "-i", c->credential,
+                   c->user && *c->user ? c->user : "root",
+                   c->host, (char *)NULL);
+        else
+            execlp("ssh", "ssh", "-p", port_str,
+                   c->user && *c->user ? c->user : "root",
+                   c->host, (char *)NULL);
+        _exit(1);
+    }
+    set_status("Connecting to %s via SSH...", c->host);
+}
+
+static void
+on_ssh_edit_clicked(GtkButton *btn, gpointer user_data)
+{
+    SSHConn *c = (SSHConn *)user_data;
+    SSHForm form = {
+        .is_new = 0,
+        .id = c->id, .name = g_strdup(c->name), .host = g_strdup(c->host),
+        .port = c->port, .user = g_strdup(c->user ? c->user : ""),
+        .auth_type = g_strdup("key"), .credential = g_strdup(c->credential ? c->credential : ""),
+        .group_name = g_strdup(c->group_name),
+    };
+    if (run_ssh_dialog(GTK_WINDOW(g_main_window), &form)) {
+        SSHConn updated = {
+            .id = form.id, .name = form.name, .host = form.host,
+            .port = form.port, .user = form.user, .auth_type = form.auth_type,
+            .credential = form.credential, .group_name = form.group_name,
+        };
+        ssh_update(&updated, NULL);
+        set_status("✓ Updated '%s'", form.name);
+        refresh_ssh_list();
+    }
+    g_free(form.name); g_free(form.host); g_free(form.user);
+    g_free(form.auth_type); g_free(form.credential); g_free(form.group_name);
+}
+
+static void
+on_ssh_delete_clicked(GtkButton *btn, gpointer user_data)
+{
+    SSHConn *c = (SSHConn *)user_data;
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(g_main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+        "Delete SSH connection '%s'?", c->name);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_YES) {
+        ssh_delete(c->id);
+        set_status("Deleted '%s'", c->name);
+        refresh_ssh_list();
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static GtkWidget *
+create_ssh_row(SSHConn *c)
+{
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox, 12);
+    gtk_widget_set_margin_end(hbox,   8);
+    gtk_widget_set_margin_top(hbox,   6);
+    gtk_widget_set_margin_bottom(hbox, 6);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(vbox, TRUE);
+
+    char *markup = g_strdup_printf(
+        "<b>%s</b>  <span size=\"small\" foreground=\"#86868b\">(%s)</span>",
+        c->name ? c->name : c->host, c->group_name ? c->group_name : "");
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title), markup);
+    g_free(markup);
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(title), "account-name");
+    gtk_box_pack_start(GTK_BOX(vbox), title, FALSE, FALSE, 0);
+
+    char *meta = g_strdup_printf("%s@%s:%d",
+        c->user && *c->user ? c->user : "root", c->host, c->port);
+    GtkWidget *meta_lbl = gtk_label_new(meta);
+    g_free(meta);
+    gtk_widget_set_halign(meta_lbl, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(meta_lbl), "account-meta");
+    gtk_box_pack_start(GTK_BOX(vbox), meta_lbl, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(hbox), vbox, TRUE, TRUE, 0);
+
+    GtkWidget *conn_btn = gtk_button_new_with_label("Connect");
+    gtk_style_context_add_class(gtk_widget_get_style_context(conn_btn), "open-button");
+    g_signal_connect(conn_btn, "clicked", G_CALLBACK(on_ssh_connect_clicked), c);
+    gtk_box_pack_start(GTK_BOX(hbox), conn_btn, FALSE, FALSE, 0);
+
+    GtkWidget *edit_btn = gtk_button_new_with_label("Edit");
+    gtk_style_context_add_class(gtk_widget_get_style_context(edit_btn), "edit-button");
+    g_signal_connect(edit_btn, "clicked", G_CALLBACK(on_ssh_edit_clicked), c);
+    gtk_box_pack_start(GTK_BOX(hbox), edit_btn, FALSE, FALSE, 0);
+
+    GtkWidget *del_btn = gtk_button_new_with_label("Delete");
+    gtk_style_context_add_class(gtk_widget_get_style_context(del_btn), "delete-button");
+    g_signal_connect(del_btn, "clicked", G_CALLBACK(on_ssh_delete_clicked), c);
+    gtk_box_pack_start(GTK_BOX(hbox), del_btn, FALSE, FALSE, 0);
+
+    return hbox;
+}
+
+static void
+on_ssh_search_changed(GtkSearchEntry *entry, gpointer data)
+{
+    (void)entry; (void)data;
+    refresh_ssh_list();
+}
+
+static void
+on_ssh_add_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    SSHForm form = { .is_new = 1, .port = 22, .auth_type = g_strdup("key"),
+        .credential = g_strdup(""), .group_name = g_strdup("") };
+    if (run_ssh_dialog(GTK_WINDOW(g_main_window), &form)) {
+        char *uuid = ssh_new_uuid();
+        SSHConn c = {
+            .id = uuid, .name = form.name, .host = form.host,
+            .port = form.port, .user = form.user, .auth_type = form.auth_type,
+            .credential = form.credential, .group_name = form.group_name,
+        };
+        ssh_insert(&c, NULL);
+        ssh_conn_free(&c);
+        g_free(uuid);
+        set_status("✓ Added '%s'", form.name);
+        refresh_ssh_list();
+    }
+    g_free(form.name); g_free(form.host); g_free(form.user);
+    g_free(form.auth_type); g_free(form.credential); g_free(form.group_name);
+}
+
+static void
+on_ssh_import_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    ssh_import_config();
+    refresh_ssh_list();
+}
+
+static void
+refresh_ssh_list(void)
+{
+    if (g_ssh_list_box == NULL) return;
+
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_ssh_list_box));
+    for (GList *l = kids; l != NULL; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    const char *search = g_ssh_search
+        ? gtk_entry_get_text(GTK_ENTRY(g_ssh_search)) : NULL;
+    GPtrArray *conns = ssh_list_connections(search);
+
+    if (g_ssh_count_lbl) {
+        char *txt = g_strdup_printf("%d connections", conns->len);
+        gtk_label_set_text(GTK_LABEL(g_ssh_count_lbl), txt);
+        g_free(txt);
+    }
+
+    if (conns->len == 0) {
+        GtkWidget *row = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+        GtkWidget *empty = gtk_label_new("No SSH connections. Add one or import from ~/.ssh/config.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(empty), "empty-label");
+        gtk_widget_set_halign(empty, GTK_ALIGN_CENTER);
+        gtk_container_add(GTK_CONTAINER(row), empty);
+        gtk_container_add(GTK_CONTAINER(g_ssh_list_box), row);
+    } else {
+        for (guint i = 0; i < conns->len; i++) {
+            SSHConn *c = g_ptr_array_index(conns, i);
+            g_ptr_array_index(conns, i) = NULL;
+            GtkWidget *r = gtk_list_box_row_new();
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_container_add(GTK_CONTAINER(r), create_ssh_row(c));
+            gtk_container_add(GTK_CONTAINER(g_ssh_list_box), r);
+            g_object_set_data_full(G_OBJECT(r), "conn", c,
+                (GDestroyNotify)ssh_conn_free);
+        }
+    }
+    g_ptr_array_free(conns, TRUE);
+    gtk_widget_show_all(g_ssh_list_box);
+}
+
+static GtkWidget *
+build_ssh_tab(void)
+{
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(header), "header-box");
+    gtk_box_pack_start(GTK_BOX(root), header, FALSE, FALSE, 0);
+
+    GtkWidget *header_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(header_text, TRUE);
+
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title),
+        "<span font_weight=\"bold\" size=\"12000\">SSH Connections</span>");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(title), "title-label");
+    gtk_box_pack_start(GTK_BOX(header_text), title, FALSE, FALSE, 0);
+
+    GtkWidget *subtitle = gtk_label_new("Manage remote SSH connections");
+    gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(subtitle), "subtitle-label");
+    gtk_box_pack_start(GTK_BOX(header_text), subtitle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), header_text, TRUE, TRUE, 0);
+
+    g_ssh_count_lbl = gtk_label_new("");
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_ssh_count_lbl), "subtitle-label");
+    gtk_box_pack_end(GTK_BOX(header), g_ssh_count_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *import_btn = gtk_button_new_with_label("Import ~/.ssh/config");
+    gtk_style_context_add_class(gtk_widget_get_style_context(import_btn), "edit-button");
+    g_signal_connect(import_btn, "clicked", G_CALLBACK(on_ssh_import_clicked), NULL);
+    gtk_box_pack_end(GTK_BOX(header), import_btn, FALSE, FALSE, 0);
+
+    GtkWidget *add_btn = gtk_button_new_with_label("+ Add");
+    gtk_style_context_add_class(gtk_widget_get_style_context(add_btn), "add-button");
+    g_signal_connect(add_btn, "clicked", G_CALLBACK(on_ssh_add_clicked), NULL);
+    gtk_box_pack_end(GTK_BOX(header), add_btn, FALSE, FALSE, 0);
+
+    GtkWidget *search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_margin_start(search_bar, 12); gtk_widget_set_margin_end(search_bar, 12);
+    gtk_widget_set_margin_top(search_bar, 8); gtk_widget_set_margin_bottom(search_bar, 8);
+    g_ssh_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_ssh_search), "Search by name, host, or group...");
+    gtk_widget_set_hexpand(g_ssh_search, TRUE);
+    g_signal_connect(g_ssh_search, "search-changed",
+        G_CALLBACK(on_ssh_search_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(search_bar), g_ssh_search, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), search_bar, FALSE, FALSE, 0);
+
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
+
+    g_ssh_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_ssh_list_box), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(scrolled), g_ssh_list_box);
+
+    ssh_db_init();
+    refresh_ssh_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  *  Config Opener tab (tab 1) — dynamic, SQLite-backed
  * ──────────────────────────────────────────────────────────────────────── */
 
@@ -3955,6 +4606,10 @@ main(int argc, char *argv[])
     GtkWidget *tab_claude = build_claude_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_claude,
         gtk_label_new("Claude"));
+
+    GtkWidget *tab_ssh = build_ssh_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_ssh,
+        gtk_label_new("SSH"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
