@@ -1543,8 +1543,8 @@ static const HomeCard g_home_cards[] = {
     {"📱", "Mimo",            "Mimo session index",          7},
     {"⚡", "Freebuff",        "Freebuff session index",      8},
     {"🔌", "Port Monitor",    "Active TCP ports",            9},
-    {"⚙️", "Config Opener",   "Edit config files",           6},
-    {"🔄", "Claude Switcher", "Switch API accounts",         7},
+    {"⚙️", "Config Opener",   "Edit config files",          10},
+    {"🔄", "Claude Switcher", "Switch API accounts",        11},
     {NULL, NULL, NULL, -1},
 };
 
@@ -4080,6 +4080,460 @@ build_chat_web_tab(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+ *  Kimchi Session Manager tab
+ *  Similar JSONL indexer as Claude, with --prefix/suffix path encoding
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char *id;
+    char *project_name;
+    char *decoded_path;
+    char *ai_title;
+    char *first_message;
+    long  last_modified;
+} KimchiSession;
+
+static GtkWidget *g_kimchi_list_box = NULL;
+
+static void refresh_kimchi_list(void);
+
+static void kimchi_session_free(KimchiSession *s) {
+    if (!s) return;
+    g_free(s->id); g_free(s->project_name); g_free(s->decoded_path);
+    g_free(s->ai_title); g_free(s->first_message); g_free(s);
+}
+
+static char *kimchi_decode_path(const char *encoded) {
+    if (!encoded) return g_strdup("");
+    GString *s = g_string_new(encoded);
+    if (g_str_has_prefix(s->str, "--")) g_string_erase(s, 0, 2);
+    if (g_str_has_suffix(s->str, "--"))
+        g_string_truncate(s, s->len - 2);
+    for (gsize i = 0; i < s->len; i++)
+        if (s->str[i] == '-') s->str[i] = '/';
+    char *result = g_strdup_printf("/%s", s->str);
+    g_string_free(s, TRUE);
+    return result;
+}
+
+static char *get_kimchi_projects_dir(void) {
+    const char *home = g_get_home_dir();
+    return g_strdup_printf("%s/.local/share/kimchi/projects", home);
+}
+
+static void
+kimchi_scan_and_index(GPtrArray *arr)
+{
+    char *base = get_kimchi_projects_dir();
+    DIR *d = opendir(base);
+    if (!d) { g_free(base); return; }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char *subdir = g_build_filename(base, ent->d_name, NULL);
+        DIR *sd = opendir(subdir);
+        if (!sd) { g_free(subdir); continue; }
+        struct dirent *se;
+        while ((se = readdir(sd)) != NULL) {
+            if (!g_str_has_suffix(se->d_name, ".jsonl")) continue;
+            char *fp = g_build_filename(subdir, se->d_name, NULL);
+            GStatBuf st;
+            if (g_stat(fp, &st) != 0) { g_free(fp); continue; }
+            char *title = NULL, *msg = NULL;
+            claude_parse_jsonl(fp, &title, &msg);
+            char *dotless = g_strdup(se->d_name);
+            char *dot = strrchr(dotless, '.');
+            if (dot) *dot = '\0';
+            KimchiSession *s = g_new0(KimchiSession, 1);
+            s->id            = dotless;
+            s->project_name  = g_strdup(ent->d_name);
+            s->decoded_path  = kimchi_decode_path(ent->d_name);
+            s->ai_title      = title;
+            s->first_message = msg;
+            s->last_modified = (long)st.st_mtime;
+            g_ptr_array_add(arr, s);
+            g_free(fp);
+        }
+        closedir(sd);
+        g_free(subdir);
+    }
+    closedir(d);
+    g_free(base);
+}
+
+static void
+on_kimchi_resume_clicked(GtkButton *btn, gpointer user_data)
+{
+    KimchiSession *s = (KimchiSession *)user_data;
+    (void)btn;
+    pid_t pid = fork();
+    if (pid == 0) { execlp("kimchi", "kimchi", "--resume", s->id, (char *)NULL); _exit(1); }
+    set_status("Launching kimchi: %s", s->ai_title ? s->ai_title : s->id);
+}
+
+static void
+on_kimchi_open_dir_clicked(GtkButton *btn, gpointer user_data)
+{ KimchiSession *s = (KimchiSession *)user_data; launch_editor(GTK_WIDGET(btn), s->decoded_path); }
+
+static GtkWidget *create_kimchi_row(KimchiSession *s) {
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox, 12); gtk_widget_set_margin_end(hbox, 8);
+    gtk_widget_set_margin_top(hbox, 6); gtk_widget_set_margin_bottom(hbox, 6);
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(vbox, TRUE);
+    const char *t = s->ai_title ? s->ai_title : (s->first_message ? s->first_message : "Kimchi Session");
+    GtkWidget *tl = gtk_label_new(t);
+    gtk_widget_set_halign(tl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(tl), PANGO_ELLIPSIZE_END);
+    gtk_style_context_add_class(gtk_widget_get_style_context(tl), "account-name");
+    gtk_box_pack_start(GTK_BOX(vbox), tl, FALSE, FALSE, 0);
+    char *dp = display_path(s->decoded_path);
+    char *rel = format_relative_time((long)s->last_modified * 1000);
+    char *mk = g_strdup_printf("<span size=\"small\" foreground=\"#86868b\">%s · %s</span>", dp, rel);
+    GtkWidget *ml = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(ml), mk);
+    g_free(mk); g_free(dp); g_free(rel);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ml), "account-meta");
+    gtk_box_pack_start(GTK_BOX(vbox), ml, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hbox), vbox, TRUE, TRUE, 0);
+    GtkWidget *rb = gtk_button_new_with_label("Resume");
+    gtk_style_context_add_class(gtk_widget_get_style_context(rb), "open-button");
+    g_signal_connect(rb, "clicked", G_CALLBACK(on_kimchi_resume_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), rb, FALSE, FALSE, 0);
+    GtkWidget *ob = gtk_button_new_with_label("Open Dir");
+    gtk_style_context_add_class(gtk_widget_get_style_context(ob), "edit-button");
+    g_signal_connect(ob, "clicked", G_CALLBACK(on_kimchi_open_dir_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), ob, FALSE, FALSE, 0);
+    return hbox;
+}
+
+static void refresh_kimchi_list(void) {
+    if (!g_kimchi_list_box) return;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_kimchi_list_box));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+    GPtrArray *sessions = g_ptr_array_new_with_free_func((GDestroyNotify)kimchi_session_free);
+    kimchi_scan_and_index(sessions);
+    if (sessions->len == 0) {
+        GtkWidget *r = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+        GtkWidget *e = gtk_label_new("No Kimchi sessions found.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_kimchi_list_box), r);
+    } else {
+        for (guint i = 0; i < sessions->len; i++) {
+            KimchiSession *s = g_ptr_array_index(sessions, i);
+            g_ptr_array_index(sessions, i) = NULL;
+            GtkWidget *r = gtk_list_box_row_new();
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_container_add(GTK_CONTAINER(r), create_kimchi_row(s));
+            gtk_container_add(GTK_CONTAINER(g_kimchi_list_box), r);
+            g_object_set_data_full(G_OBJECT(r), "session", s, (GDestroyNotify)kimchi_session_free);
+        }
+    }
+    g_ptr_array_free(sessions, TRUE);
+    gtk_widget_show_all(g_kimchi_list_box);
+}
+
+static GtkWidget *build_kimchi_tab(void) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hdr), "header-box");
+    GtkWidget *ht = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(ht, TRUE);
+    GtkWidget *t = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(t), "<span font_weight=\"bold\" size=\"12000\">Kimchi Sessions</span>");
+    gtk_widget_set_halign(t, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(t), "title-label");
+    gtk_box_pack_start(GTK_BOX(ht), t, FALSE, FALSE, 0);
+    GtkWidget *st = gtk_label_new("Indexed CLI sessions from ~/.local/share/kimchi/");
+    gtk_widget_set_halign(st, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(st), "subtitle-label");
+    gtk_box_pack_start(GTK_BOX(ht), st, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hdr), ht, TRUE, TRUE, 0);
+    GtkWidget *rescan = gtk_button_new_with_label("Rescan");
+    gtk_style_context_add_class(gtk_widget_get_style_context(rescan), "edit-button");
+    g_signal_connect_swapped(rescan, "clicked", G_CALLBACK(refresh_kimchi_list), NULL);
+    gtk_box_pack_end(GTK_BOX(hdr), rescan, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), hdr, FALSE, FALSE, 0);
+    GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(sc), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    g_kimchi_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_kimchi_list_box), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(sc), g_kimchi_list_box);
+    gtk_box_pack_start(GTK_BOX(root), sc, TRUE, TRUE, 0);
+    refresh_kimchi_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Mimo Session Manager tab (shell wrapper + JSON parse)
+ *  Runs: mimo session list --format json
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static GtkWidget *g_mimo_list_box = NULL;
+
+static void refresh_mimo_list(void) {
+    if (!g_mimo_list_box) return;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_mimo_list_box));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    gchar *out = NULL; gint exit_status = 0;
+    gboolean ok = g_spawn_command_line_sync(
+        "mimo session list --format json", &out, NULL, &exit_status, NULL);
+
+    if (!ok || exit_status != 0 || !out) {
+        GtkWidget *r = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new(ok ? "mimo command returned no data." :
+                                     "mimo not found. Install: npm i -g mimo");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_mimo_list_box), r);
+        g_free(out);
+        gtk_widget_show_all(g_mimo_list_box);
+        return;
+    }
+
+    /* Simple JSON array parser: line-based, extract id/title/directory */
+    gchar **lines = g_strsplit(out, "\n", -1);
+    g_free(out);
+    int count = 0;
+
+    for (int i = 0; lines[i] != NULL; i++) {
+        char *id_str = strstr(lines[i], "\"id\"");
+        if (!id_str) continue;
+        GtkWidget *r = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+        GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_margin_start(hbox, 12); gtk_widget_set_margin_end(hbox, 8);
+        gtk_widget_set_margin_top(hbox, 6); gtk_widget_set_margin_bottom(hbox, 6);
+        char *label_str = g_strdup_printf("Mimo session #%d", ++count);
+        GtkWidget *lbl = gtk_label_new(label_str);
+        g_free(label_str);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_style_context_add_class(gtk_widget_get_style_context(lbl), "account-name");
+        gtk_box_pack_start(GTK_BOX(hbox), lbl, TRUE, TRUE, 0);
+        gtk_container_add(GTK_CONTAINER(r), hbox);
+        gtk_container_add(GTK_CONTAINER(g_mimo_list_box), r);
+    }
+
+    if (count == 0) {
+        GtkWidget *r = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new("No mimo sessions found.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_mimo_list_box), r);
+    }
+    g_strfreev(lines);
+    gtk_widget_show_all(g_mimo_list_box);
+}
+
+static GtkWidget *build_mimo_tab(void) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hdr), "header-box");
+    GtkWidget *t = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(t), "<span font_weight=\"bold\" size=\"12000\">Mimo Sessions</span>");
+    gtk_style_context_add_class(gtk_widget_get_style_context(t), "title-label");
+    gtk_box_pack_start(GTK_BOX(hdr), t, TRUE, TRUE, 0);
+    GtkWidget *rescan = gtk_button_new_with_label("Rescan");
+    gtk_style_context_add_class(gtk_widget_get_style_context(rescan), "edit-button");
+    g_signal_connect_swapped(rescan, "clicked", G_CALLBACK(refresh_mimo_list), NULL);
+    gtk_box_pack_end(GTK_BOX(hdr), rescan, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), hdr, FALSE, FALSE, 0);
+    GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
+    g_mimo_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_mimo_list_box), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(sc), g_mimo_list_box);
+    gtk_box_pack_start(GTK_BOX(root), sc, TRUE, TRUE, 0);
+    refresh_mimo_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Freebuff Session Manager tab
+ *  Scans ~/.config/manicode/projects/<projName>
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static GtkWidget *g_freebuff_list_box = NULL;
+
+static void refresh_freebuff_list(void) {
+    if (!g_freebuff_list_box) return;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_freebuff_list_box));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    const char *home = g_get_home_dir();
+    char *base = g_strdup_printf("%s/.config/manicode/projects", home);
+    DIR *d = opendir(base);
+    if (!d) {
+        GtkWidget *r = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new("No Freebuff/Manicode projects found.\n"
+            "Start a freebuff session first.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_freebuff_list_box), r);
+        g_free(base);
+        gtk_widget_show_all(g_freebuff_list_box);
+        return;
+    }
+
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char *proj_dir = g_build_filename(base, ent->d_name, NULL);
+        if (!g_file_test(proj_dir, G_FILE_TEST_IS_DIR)) { g_free(proj_dir); continue; }
+        GtkWidget *r = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+        GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_margin_start(hbox, 12); gtk_widget_set_margin_end(hbox, 8);
+        GtkWidget *nm = gtk_label_new(ent->d_name);
+        gtk_widget_set_hexpand(nm, TRUE);
+        gtk_widget_set_halign(nm, GTK_ALIGN_START);
+        gtk_style_context_add_class(gtk_widget_get_style_context(nm), "account-name");
+        gtk_box_pack_start(GTK_BOX(hbox), nm, TRUE, TRUE, 0);
+        GtkWidget *ob = gtk_button_new_with_label("Open Dir");
+        gtk_style_context_add_class(gtk_widget_get_style_context(ob), "edit-button");
+        g_signal_connect_data(ob, "clicked",
+            G_CALLBACK(launch_editor), g_strdup(proj_dir), (GClosureNotify)g_free, 0);
+        gtk_box_pack_start(GTK_BOX(hbox), ob, FALSE, FALSE, 0);
+        gtk_container_add(GTK_CONTAINER(r), hbox);
+        gtk_container_add(GTK_CONTAINER(g_freebuff_list_box), r);
+        count++;
+        g_free(proj_dir);
+    }
+    closedir(d);
+    g_free(base);
+    if (count == 0) {
+        GtkWidget *r = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new("No Freebuff sessions found.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_freebuff_list_box), r);
+    }
+    gtk_widget_show_all(g_freebuff_list_box);
+}
+
+static GtkWidget *build_freebuff_tab(void) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hdr), "header-box");
+    GtkWidget *t = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(t), "<span font_weight=\"bold\" size=\"12000\">Freebuff Sessions</span>");
+    gtk_style_context_add_class(gtk_widget_get_style_context(t), "title-label");
+    gtk_box_pack_start(GTK_BOX(hdr), t, TRUE, TRUE, 0);
+    GtkWidget *rescan = gtk_button_new_with_label("Rescan");
+    gtk_style_context_add_class(gtk_widget_get_style_context(rescan), "edit-button");
+    g_signal_connect_swapped(rescan, "clicked", G_CALLBACK(refresh_freebuff_list), NULL);
+    gtk_box_pack_end(GTK_BOX(hdr), rescan, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), hdr, FALSE, FALSE, 0);
+    GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
+    g_freebuff_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_freebuff_list_box), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(sc), g_freebuff_list_box);
+    gtk_box_pack_start(GTK_BOX(root), sc, TRUE, TRUE, 0);
+    refresh_freebuff_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Port Monitor tab
+ *  Parses 'ss -tlnp' output for active TCP listening ports
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static GtkWidget *g_port_list_box = NULL;
+
+static void refresh_port_list(void) {
+    if (!g_port_list_box) return;
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_port_list_box));
+    for (GList *l = kids; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    gchar *out = NULL; gint status = 0;
+    gboolean ok = g_spawn_command_line_sync("ss -tlnp", &out, NULL, &status, NULL);
+    if (!ok || !out) {
+        /* Fallback: try netstat */
+        g_free(out);
+        ok = g_spawn_command_line_sync("netstat -tlnp", &out, NULL, &status, NULL);
+    }
+    if (!ok || !out) {
+        GtkWidget *r = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new("Could not run ss or netstat.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_port_list_box), r);
+        gtk_widget_show_all(g_port_list_box);
+        return;
+    }
+
+    gchar **lines = g_strsplit(out, "\n", -1);
+    g_free(out);
+    int count = 0;
+
+    for (int i = 0; lines[i] != NULL; i++) {
+        if (lines[i][0] == '\0' || g_str_has_prefix(lines[i], "Netid")) continue;
+        GtkWidget *r = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+        GtkWidget *lbl = gtk_label_new(lines[i]);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_widget_set_margin_start(lbl, 12); gtk_widget_set_margin_top(lbl, 3);
+        gtk_widget_set_margin_bottom(lbl, 3);
+        gtk_style_context_add_class(gtk_widget_get_style_context(lbl), "account-meta");
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_family_new("Monospace"));
+        pango_attr_list_insert(attrs, pango_attr_size_new(11 * PANGO_SCALE));
+        gtk_label_set_attributes(GTK_LABEL(lbl), attrs);
+        pango_attr_list_unref(attrs);
+        gtk_container_add(GTK_CONTAINER(r), lbl);
+        gtk_container_add(GTK_CONTAINER(g_port_list_box), r);
+        count++;
+    }
+    g_strfreev(lines);
+
+    if (count == 0) {
+        GtkWidget *r = gtk_list_box_row_new();
+        GtkWidget *e = gtk_label_new("No listening TCP ports found.");
+        gtk_style_context_add_class(gtk_widget_get_style_context(e), "empty-label");
+        gtk_container_add(GTK_CONTAINER(r), e);
+        gtk_container_add(GTK_CONTAINER(g_port_list_box), r);
+    }
+    gtk_widget_show_all(g_port_list_box);
+}
+
+static GtkWidget *build_port_monitor_tab(void) {
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(hdr), "header-box");
+    GtkWidget *ht = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(ht, TRUE);
+    GtkWidget *t = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(t), "<span font_weight=\"bold\" size=\"12000\">Port Monitor</span>");
+    gtk_widget_set_halign(t, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(t), "title-label");
+    gtk_box_pack_start(GTK_BOX(ht), t, FALSE, FALSE, 0);
+    GtkWidget *sub = gtk_label_new("Active TCP listening ports (ss -tlnp)");
+    gtk_widget_set_halign(sub, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(sub), "subtitle-label");
+    gtk_box_pack_start(GTK_BOX(ht), sub, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hdr), ht, TRUE, TRUE, 0);
+    GtkWidget *rescan = gtk_button_new_with_label("Refresh");
+    gtk_style_context_add_class(gtk_widget_get_style_context(rescan), "edit-button");
+    g_signal_connect_swapped(rescan, "clicked", G_CALLBACK(refresh_port_list), NULL);
+    gtk_box_pack_end(GTK_BOX(hdr), rescan, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), hdr, FALSE, FALSE, 0);
+    GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
+    g_port_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_port_list_box), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(sc), g_port_list_box);
+    gtk_box_pack_start(GTK_BOX(root), sc, TRUE, TRUE, 0);
+    refresh_port_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  *  Config Opener tab (tab 1) — dynamic, SQLite-backed
  * ──────────────────────────────────────────────────────────────────────── */
 
@@ -5276,6 +5730,22 @@ main(int argc, char *argv[])
     GtkWidget *tab_chat = build_chat_web_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_chat,
         gtk_label_new("Chat Web"));
+
+    GtkWidget *tab_kimchi = build_kimchi_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_kimchi,
+        gtk_label_new("Kimchi"));
+
+    GtkWidget *tab_mimo = build_mimo_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_mimo,
+        gtk_label_new("Mimo"));
+
+    GtkWidget *tab_freebuff = build_freebuff_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_freebuff,
+        gtk_label_new("Freebuff"));
+
+    GtkWidget *tab_ports = build_port_monitor_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_ports,
+        gtk_label_new("Port Monitor"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
