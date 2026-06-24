@@ -1543,8 +1543,8 @@ static const HomeCard g_home_cards[] = {
     {"📱", "Mimo",            "Mimo session index",          7},
     {"⚡", "Freebuff",        "Freebuff session index",      8},
     {"🔌", "Port Monitor",    "Active TCP ports",            9},
-    {"⚙️", "Config Opener",   "Edit config files",           4},
-    {"🔄", "Claude Switcher", "Switch API accounts",         5},
+    {"⚙️", "Config Opener",   "Edit config files",           5},
+    {"🔄", "Claude Switcher", "Switch API accounts",         6},
     {NULL, NULL, NULL, -1},
 };
 
@@ -3422,6 +3422,236 @@ build_ssh_tab(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+ *  PTY Terminal tab using libvte
+ *  Multiple VteTerminal instances with persistent sessions
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char      *id;
+    char      *name;
+    VteTerminal *terminal;
+    GtkWidget *scrolled;
+    gboolean   is_running;
+    GPid       child_pid;
+} TermSession;
+
+static GtkWidget    *g_term_container  = NULL;
+static GtkWidget    *g_term_tabs       = NULL;
+static GPtrArray    *g_term_sessions   = NULL;
+static TermSession  *g_active_term     = NULL;
+static int           g_term_counter    = 0;
+
+static void
+term_session_free(TermSession *ts)
+{
+    if (ts == NULL) return;
+    g_free(ts->id);
+    g_free(ts->name);
+    g_free(ts);
+}
+
+static void
+on_term_child_exited(VteTerminal *terminal, gint status, gpointer user_data)
+{
+    TermSession *ts = (TermSession *)user_data;
+    (void)terminal;
+    ts->is_running = FALSE;
+    set_status("Terminal '%s' exited (status %d)", ts->name, status);
+}
+
+static void
+term_launch(TermSession *ts, const char *command, const char *cwd)
+{
+    if (ts->terminal == NULL) return;
+
+    char *argv[] = {"/bin/bash", "-c", (char *)command, NULL};
+    char *fallback_argv[] = {"/bin/sh", "-c", (char *)command, NULL};
+
+    vte_terminal_spawn_async(
+        ts->terminal,
+        VTE_PTY_DEFAULT,
+        cwd ? cwd : g_get_home_dir(),
+        g_file_test("/bin/bash", G_FILE_TEST_IS_EXECUTABLE) ? argv : fallback_argv,
+        NULL, 0,
+        G_SPAWN_DEFAULT,
+        NULL, NULL, NULL,
+        -1, NULL, NULL, NULL);
+
+    ts->is_running = TRUE;
+}
+
+static TermSession *
+term_create_session(const char *name)
+{
+    TermSession *ts = g_new0(TermSession, 1);
+    ts->id   = g_strdup_printf("term-%d", ++g_term_counter);
+    ts->name = g_strdup(name ? name : ts->id);
+
+    ts->terminal = VTE_TERMINAL(vte_terminal_new());
+    vte_terminal_set_scrollback_lines(ts->terminal, 100000);
+    vte_terminal_set_font_scale(ts->terminal, 1.0);
+
+    PangoFontDescription *font_desc = pango_font_description_from_string(
+        "Monospace 12");
+    vte_terminal_set_font(ts->terminal, font_desc);
+    pango_font_description_free(font_desc);
+
+    GtkWidget *scrolled = gtk_scrolled_window_new(
+        gtk_scrollable_get_hadjustment(GTK_SCROLLABLE(ts->terminal)),
+        gtk_scrollable_get_vadjustment(GTK_SCROLLABLE(ts->terminal)));
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scrolled), GTK_WIDGET(ts->terminal));
+    ts->scrolled = scrolled;
+
+    g_signal_connect(ts->terminal, "child-exited",
+        G_CALLBACK(on_term_child_exited), ts);
+
+    if (g_term_sessions == NULL)
+        g_term_sessions = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)term_session_free);
+    g_ptr_array_add(g_term_sessions, ts);
+    return ts;
+}
+
+static void
+term_switch_to(TermSession *ts)
+{
+    if (g_term_container == NULL || ts == NULL) return;
+
+    if (g_active_term != NULL && g_active_term != ts) {
+        gtk_container_remove(GTK_CONTAINER(g_term_container),
+            g_active_term->scrolled);
+    }
+
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_term_container));
+    for (GList *l = kids; l; l = l->next)
+        gtk_container_remove(GTK_CONTAINER(g_term_container), GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    gtk_container_add(GTK_CONTAINER(g_term_container), ts->scrolled);
+    gtk_widget_show_all(ts->scrolled);
+    gtk_widget_grab_focus(GTK_WIDGET(ts->terminal));
+    g_active_term = ts;
+    set_status("Terminal: %s", ts->name);
+}
+
+static void
+on_term_tab_switch(GtkNotebook *nb, GtkWidget *page, guint page_num,
+                   gpointer data)
+{
+    (void)nb; (void)page; (void)data;
+    if (g_term_sessions == NULL || page_num >= g_term_sessions->len) return;
+    TermSession *ts = g_ptr_array_index(g_term_sessions, page_num);
+    term_switch_to(ts);
+}
+
+static void
+on_term_new_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    TermSession *ts = term_create_session(NULL);
+    term_launch(ts, "bash", g_get_home_dir());
+
+    GtkWidget *tab_label = gtk_label_new(ts->name);
+    gtk_notebook_append_page(GTK_NOTEBOOK(g_term_tabs),
+        gtk_label_new(""), tab_label);
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(g_term_tabs),
+        gtk_notebook_get_n_pages(GTK_NOTEBOOK(g_term_tabs)) - 1);
+
+    term_switch_to(ts);
+    set_status("New terminal session: %s", ts->name);
+}
+
+static void
+run_tool_in_terminal(GtkButton *btn, const char *tool_name, const char *cmd)
+{
+    (void)btn;
+    TermSession *ts = term_create_session(tool_name);
+    term_launch(ts, cmd, g_get_home_dir());
+
+    GtkWidget *tab_label = gtk_label_new(tool_name);
+    gtk_notebook_append_page(GTK_NOTEBOOK(g_term_tabs),
+        gtk_label_new(""), tab_label);
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(g_term_tabs),
+        gtk_notebook_get_n_pages(GTK_NOTEBOOK(g_term_tabs)) - 1);
+
+    term_switch_to(ts);
+    set_status("Launching %s in terminal", tool_name);
+}
+
+static void on_term_launch_bash(GtkButton *btn, gpointer d)
+{ run_tool_in_terminal(btn, "bash", "bash"); }
+
+static void on_term_launch_opencode(GtkButton *btn, gpointer d)
+{ run_tool_in_terminal(btn, "opencode", "opencode"); }
+
+static void on_term_launch_claude(GtkButton *btn, gpointer d)
+{ run_tool_in_terminal(btn, "claude", "claude"); }
+
+static void on_term_launch_htop(GtkButton *btn, gpointer d)
+{ run_tool_in_terminal(btn, "htop", "htop"); }
+
+static GtkWidget *
+build_terminal_tab(void)
+{
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    /* Toolbar */
+    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(toolbar), "header-box");
+    gtk_widget_set_margin_start(toolbar, 4);
+    gtk_widget_set_margin_end(toolbar, 4);
+    gtk_widget_set_margin_top(toolbar, 4);
+    gtk_widget_set_margin_bottom(toolbar, 4);
+
+    GtkWidget *new_btn = gtk_button_new_with_label("+ New Terminal");
+    gtk_style_context_add_class(gtk_widget_get_style_context(new_btn), "add-button");
+    g_signal_connect(new_btn, "clicked", G_CALLBACK(on_term_new_clicked), NULL);
+    gtk_box_pack_start(GTK_BOX(toolbar), new_btn, FALSE, FALSE, 0);
+
+    static const struct { const char *label; GCallback cb; } tools[] = {
+        {"bash",     G_CALLBACK(on_term_launch_bash)},
+        {"opencode", G_CALLBACK(on_term_launch_opencode)},
+        {"claude",   G_CALLBACK(on_term_launch_claude)},
+        {"htop",     G_CALLBACK(on_term_launch_htop)},
+        {NULL, NULL},
+    };
+    for (int i = 0; tools[i].label != NULL; i++) {
+        GtkWidget *btn = gtk_button_new_with_label(tools[i].label);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(btn), "edit-button");
+        g_signal_connect(btn, "clicked", tools[i].cb, NULL);
+        gtk_box_pack_start(GTK_BOX(toolbar), btn, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(root), toolbar, FALSE, FALSE, 0);
+
+    /* Term tabs (for switching between sessions) */
+    g_term_tabs = gtk_notebook_new();
+    gtk_notebook_set_show_tabs(GTK_NOTEBOOK(g_term_tabs), FALSE);
+    gtk_notebook_set_show_border(GTK_NOTEBOOK(g_term_tabs), FALSE);
+    g_signal_connect(g_term_tabs, "switch-page",
+        G_CALLBACK(on_term_tab_switch), NULL);
+    gtk_box_pack_start(GTK_BOX(root), g_term_tabs, FALSE, FALSE, 0);
+    gtk_widget_hide(g_term_tabs);
+
+    /* Container for the active VteTerminal */
+    g_term_container = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(root), g_term_container, TRUE, TRUE, 0);
+
+    /* Auto-create a bash terminal on init */
+    TermSession *ts = term_create_session("bash");
+    term_launch(ts, "bash", g_get_home_dir());
+    GtkWidget *empty_label = gtk_label_new("");
+    gtk_notebook_append_page(GTK_NOTEBOOK(g_term_tabs), empty_label,
+        gtk_label_new("bash"));
+    term_switch_to(ts);
+
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  *  Config Opener tab (tab 1) — dynamic, SQLite-backed
  * ──────────────────────────────────────────────────────────────────────── */
 
@@ -4610,6 +4840,10 @@ main(int argc, char *argv[])
     GtkWidget *tab_ssh = build_ssh_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_ssh,
         gtk_label_new("SSH"));
+
+    GtkWidget *tab_term = build_terminal_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_term,
+        gtk_label_new("Terminal"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
