@@ -1543,8 +1543,8 @@ static const HomeCard g_home_cards[] = {
     {"📱", "Mimo",            "Mimo session index",          7},
     {"⚡", "Freebuff",        "Freebuff session index",      8},
     {"🔌", "Port Monitor",    "Active TCP ports",            9},
-    {"⚙️", "Config Opener",   "Edit config files",           1},
-    {"🔄", "Claude Switcher", "Switch API accounts",         2},
+    {"⚙️", "Config Opener",   "Edit config files",           3},
+    {"🔄", "Claude Switcher", "Switch API accounts",         4},
     {NULL, NULL, NULL, -1},
 };
 
@@ -2102,6 +2102,671 @@ build_opencode_tab(void)
     gtk_container_add(GTK_CONTAINER(scrolled), g_opencode_list_box);
 
     refresh_opencode_list();
+    return root;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Claude Session Manager tab
+ *  Indexes ~/.claude/projects/<dir>/<id>.jsonl sessions
+ *  SQLite cache in claude_index.db, inotify watcher for live updates
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    char *session_id;
+    char *project_dir_name;
+    char *decoded_path;
+    char *ai_title;
+    char *first_message;
+    long  last_modified;
+} ClaudeSession;
+
+static GtkWidget *g_claude_list_box  = NULL;
+static GtkWidget *g_claude_count_lbl = NULL;
+static GtkWidget *g_claude_search    = NULL;
+static sqlite3   *g_claude_idx_db    = NULL;
+
+static void refresh_claude_list(void);
+
+static void
+claude_session_free(ClaudeSession *s)
+{
+    if (s == NULL) return;
+    g_free(s->session_id);
+    g_free(s->project_dir_name);
+    g_free(s->decoded_path);
+    g_free(s->ai_title);
+    g_free(s->first_message);
+    g_free(s);
+}
+
+static char *
+get_claude_projects_dir(void)
+{
+    const char *home = g_get_home_dir();
+    if (home == NULL) home = "/tmp";
+    return g_strdup_printf("%s/.claude/projects", home);
+}
+
+static char *
+get_claude_index_db_path(void)
+{
+    char *dir = get_app_data_dir();
+    char *path = g_strdup_printf("%s/claude_index.db", dir);
+    g_free(dir);
+    return path;
+}
+
+/* Claude encodes paths as: /Users/fajar/proj -> -Users-fajar-proj
+ * Decoding: split on '-', then use backtracking to find real directories */
+static char *
+claude_decode_path(const char *encoded)
+{
+    if (encoded == NULL || *encoded == '\0') return g_strdup("");
+
+    const char *start = encoded;
+    if (*start == '-') start++;
+    if (*start == '\0') return g_strdup("/");
+
+    gchar **parts = g_strsplit(start, "-", -1);
+    int nparts = 0;
+    while (parts[nparts] != NULL) nparts++;
+
+    if (nparts == 0) {
+        g_strfreev(parts);
+        return g_strdup("/");
+    }
+
+    GString *result = g_string_new(NULL);
+    int i = 0;
+
+    while (i < nparts) {
+        gboolean found = FALSE;
+
+        for (int len = nparts - i; len >= 1; len--) {
+            GString *candidate = g_string_new("/");
+            if (result->len > 1)
+                g_string_append_len(candidate, result->str + 1, result->len - 1);
+            else
+                g_string_truncate(candidate, 0);
+
+            for (int j = 0; j < len; j++) {
+                g_string_append_c(candidate, '/');
+                g_string_append(candidate, parts[i + j]);
+            }
+
+            gboolean is_dir = g_file_test(candidate->str,
+                                           G_FILE_TEST_IS_DIR);
+            if (is_dir || (i + len == nparts)) {
+                g_string_assign(result, candidate->str);
+                g_string_free(candidate, TRUE);
+                i += len;
+                found = TRUE;
+                break;
+            }
+            g_string_free(candidate, TRUE);
+        }
+
+        if (!found) {
+            g_string_append_c(result, '/');
+            g_string_append(result, parts[i]);
+            i++;
+        }
+    }
+
+    char *final = g_string_free(result, FALSE);
+    g_strfreev(parts);
+    return final;
+}
+
+/* Simple JSONL line-by-line parser for Claude session files.
+ * Extracts ai_title (type=="ai-title") and first user message. */
+static void
+claude_parse_jsonl(const char *filepath, char **out_title, char **out_msg)
+{
+    *out_title = NULL;
+    *out_msg   = NULL;
+
+    FILE *f = fopen(filepath, "r");
+    if (f == NULL) return;
+
+    char line[16384];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '{') continue;
+
+        gboolean has_ai_title = (strstr(p, "\"type\"") != NULL &&
+                                 strstr(p, "\"ai-title\"") != NULL) ||
+                                (strstr(p, "\"aiTitle\"") != NULL);
+
+        if (has_ai_title && *out_title == NULL) {
+            char *at = strstr(p, "\"aiTitle\"");
+            if (at == NULL) at = strstr(p, "\"aiTitle\":");
+            if (at != NULL) {
+                char *colon = strchr(at, ':');
+                if (colon != NULL) {
+                    char *start = colon + 1;
+                    while (*start == ' ') start++;
+                    if (*start == '"') {
+                        start++;
+                        char *end = start;
+                        while (*end && *end != '"' && (end[-1] != '\\')) end++;
+                        *out_title = g_strndup(start, end - start);
+                    }
+                }
+            }
+        }
+
+        gboolean has_user_msg = strstr(p, "\"type\"") != NULL &&
+                                strstr(p, "\"user\"") != NULL;
+        if (strcmp(strstr(p, "\"type\"") ? strstr(p, "\"type\"") : "", "") != 0) {
+            char *type_str = strstr(p, "\"type\"");
+            if (type_str) {
+                char *colon2 = strchr(type_str, ':');
+                if (colon2) {
+                    char *val = colon2 + 1;
+                    while (*val == ' ') val++;
+                    if (*val == '"') {
+                        val++;
+                        if (strncmp(val, "user\"", 5) == 0) {
+                            has_user_msg = TRUE;
+                        } else {
+                            has_user_msg = FALSE;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (has_user_msg && *out_msg == NULL) {
+            char *content = strstr(p, "\"content\"");
+            if (content != NULL) {
+                char *colon = strchr(content, ':');
+                if (colon != NULL) {
+                    char *val = colon + 1;
+                    while (*val == ' ') val++;
+                    if (*val == '"') {
+                        val++;
+                        char *end = val;
+                        while (*end && *end != '"') {
+                            if (*end == '\\' && end[1]) end++;
+                            end++;
+                        }
+                        *out_msg = g_strndup(val,
+                            MIN((gsize)(end - val), 150));
+                    }
+                }
+            }
+        }
+
+        if (*out_title != NULL && *out_msg != NULL) break;
+    }
+    fclose(f);
+}
+
+/* Initialize the Claude session index database */
+static int
+claude_index_db_init(void)
+{
+    char *dir = get_app_data_dir();
+    ensure_dir(dir);
+    g_free(dir);
+
+    char *path = get_claude_index_db_path();
+    int rc = sqlite3_open(path, &g_claude_idx_db);
+    g_free(path);
+    if (rc != SQLITE_OK) {
+        if (g_claude_idx_db) { sqlite3_close(g_claude_idx_db); g_claude_idx_db = NULL; }
+        return -1;
+    }
+
+    const char *schema =
+        "CREATE TABLE IF NOT EXISTS claude_sessions ("
+        "  session_id TEXT PRIMARY KEY,"
+        "  project_dir TEXT NOT NULL,"
+        "  decoded_path TEXT NOT NULL,"
+        "  ai_title TEXT,"
+        "  first_message TEXT,"
+        "  last_modified INTEGER NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_claude_project "
+        "  ON claude_sessions(project_dir);";
+    sqlite3_exec(g_claude_idx_db, schema, NULL, NULL, NULL);
+    return 0;
+}
+
+static void
+claude_index_upsert(ClaudeSession *s)
+{
+    if (g_claude_idx_db == NULL) return;
+    const char *sql =
+        "INSERT OR REPLACE INTO claude_sessions "
+        "(session_id, project_dir, decoded_path, ai_title, first_message, "
+        " last_modified) VALUES (?, ?, ?, ?, ?, ?);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_claude_idx_db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_text(stmt, 1, s->session_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, s->project_dir_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, s->decoded_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, s->ai_title, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, s->first_message, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 6, s->last_modified);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void
+claude_index_remove(const char *session_id)
+{
+    if (g_claude_idx_db == NULL) return;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_claude_idx_db,
+            "DELETE FROM claude_sessions WHERE session_id=?;",
+            -1, &stmt, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(stmt, 1, session_id, -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void
+claude_index_file(const char *filepath)
+{
+    char *proj_dir_name = NULL;
+    char *session_id    = NULL;
+
+    char *basename = g_path_get_basename(filepath);
+    if (basename == NULL) return;
+    char *dot = strrchr(basename, '.');
+    if (dot) *dot = '\0';
+    session_id = g_strdup(basename);
+    g_free(basename);
+
+    char *dir = g_path_get_dirname(filepath);
+    proj_dir_name = g_path_get_basename(dir);
+    g_free(dir);
+
+    if (proj_dir_name == NULL || session_id == NULL) {
+        g_free(proj_dir_name);
+        g_free(session_id);
+        return;
+    }
+
+    gchar *data = NULL;
+    gsize len = 0;
+    if (!g_file_get_contents(filepath, &data, &len, NULL)) {
+        g_free(proj_dir_name);
+        g_free(session_id);
+        return;
+    }
+    g_free(data);
+
+    GStatBuf st;
+    if (g_stat(filepath, &st) != 0) {
+        g_free(proj_dir_name);
+        g_free(session_id);
+        return;
+    }
+
+    char *title = NULL, *msg = NULL;
+    claude_parse_jsonl(filepath, &title, &msg);
+
+    char *decoded = claude_decode_path(proj_dir_name);
+
+    ClaudeSession s = {
+        .session_id       = session_id,
+        .project_dir_name = proj_dir_name,
+        .decoded_path     = decoded,
+        .ai_title         = title,
+        .first_message    = msg,
+        .last_modified    = (long)st.st_mtime,
+    };
+    claude_index_upsert(&s);
+
+    g_free(decoded);
+    g_free(title);
+    g_free(msg);
+    g_free(proj_dir_name);
+    g_free(session_id);
+}
+
+/* Full scan of ~/.claude/projects/ */
+static void
+claude_scan_all_projects(void)
+{
+    if (g_claude_idx_db == NULL) return;
+
+    char *base = get_claude_projects_dir();
+    DIR *d = opendir(base);
+    if (d == NULL) { g_free(base); return; }
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char *subdir = g_build_filename(base, ent->d_name, NULL);
+        if (!g_file_test(subdir, G_FILE_TEST_IS_DIR)) {
+            g_free(subdir);
+            continue;
+        }
+
+        DIR *sd = opendir(subdir);
+        if (sd != NULL) {
+            struct dirent *sent;
+            while ((sent = readdir(sd)) != NULL) {
+                char *name = sent->d_name;
+                int len = strlen(name);
+                if (len < 7) continue;
+                if (strcmp(name + len - 6, ".jsonl") != 0) continue;
+                char *jp = g_build_filename(subdir, name, NULL);
+
+                if (strstr(jp, "/subagents/") != NULL) {
+                    g_free(jp);
+                    continue;
+                }
+                claude_index_file(jp);
+                g_free(jp);
+            }
+            closedir(sd);
+        }
+        g_free(subdir);
+    }
+    closedir(d);
+    g_free(base);
+}
+
+static GPtrArray *
+claude_load_sessions(const char *search)
+{
+    GPtrArray *arr = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)claude_session_free);
+    if (g_claude_idx_db == NULL) return arr;
+
+    const char *base_sql =
+        "SELECT session_id, project_dir, decoded_path, ai_title, "
+        "first_message, last_modified FROM claude_sessions";
+
+    char sql[2048];
+    if (search != NULL && *search != '\0') {
+        char *esc = g_strescape(search, NULL);
+        snprintf(sql, sizeof(sql),
+            "%s WHERE ai_title LIKE '%%%s%%' OR decoded_path LIKE '%%%s%%' "
+            "OR first_message LIKE '%%%s%%' "
+            "ORDER BY last_modified DESC LIMIT 500;", base_sql, esc, esc, esc);
+        g_free(esc);
+    } else {
+        snprintf(sql, sizeof(sql),
+            "%s ORDER BY last_modified DESC LIMIT 500;", base_sql);
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(g_claude_idx_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            ClaudeSession *s = g_new0(ClaudeSession, 1);
+            s->session_id       = g_strdup((const char *)sqlite3_column_text(stmt, 0));
+            s->project_dir_name = g_strdup((const char *)sqlite3_column_text(stmt, 1));
+            s->decoded_path     = g_strdup((const char *)sqlite3_column_text(stmt, 2));
+            s->ai_title         = g_strdup((const char *)sqlite3_column_text(stmt, 3));
+            s->first_message    = g_strdup((const char *)sqlite3_column_text(stmt, 4));
+            s->last_modified    = sqlite3_column_int64(stmt, 5);
+            g_ptr_array_add(arr, s);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return arr;
+}
+
+static const char *
+claude_display_title(ClaudeSession *s)
+{
+    if (s->ai_title && *s->ai_title) return s->ai_title;
+    if (s->first_message && *s->first_message) return s->first_message;
+    return "Claude Session";
+}
+
+static void
+on_claude_resume_clicked(GtkButton *button, gpointer user_data)
+{
+    ClaudeSession *s = (ClaudeSession *)user_data;
+    (void)button;
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("claude", "claude", "--resume", s->session_id, (char *)NULL);
+        _exit(1);
+    }
+    set_status("Launching claude session: %s", claude_display_title(s));
+}
+
+static void
+on_claude_open_dir_clicked(GtkButton *button, gpointer user_data)
+{
+    ClaudeSession *s = (ClaudeSession *)user_data;
+    if (s->decoded_path) launch_editor(GTK_WIDGET(button), s->decoded_path);
+}
+
+static void
+on_claude_delete_clicked(GtkButton *button, gpointer user_data)
+{
+    ClaudeSession *s = (ClaudeSession *)user_data;
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(g_main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        GTK_MESSAGE_QUESTION,
+        GTK_BUTTONS_YES_NO,
+        "Delete session '%s'?", claude_display_title(s));
+    gint resp = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    if (resp != GTK_RESPONSE_YES) return;
+
+    char *proj_dir = get_claude_projects_dir();
+    char *fp = g_strdup_printf("%s/%s/%s.jsonl",
+        proj_dir, s->project_dir_name, s->session_id);
+    g_unlink(fp);
+    g_free(fp);
+    g_free(proj_dir);
+
+    claude_index_remove(s->session_id);
+    set_status("Deleted Claude session '%s'", claude_display_title(s));
+    refresh_claude_list();
+}
+
+static GtkWidget *
+create_claude_row(ClaudeSession *s)
+{
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(hbox,   12);
+    gtk_widget_set_margin_end(hbox,     8);
+    gtk_widget_set_margin_top(hbox,     6);
+    gtk_widget_set_margin_bottom(hbox,  6);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(vbox, TRUE);
+
+    GtkWidget *title_lbl = gtk_label_new(claude_display_title(s));
+    gtk_widget_set_halign(title_lbl, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(title_lbl), PANGO_ELLIPSIZE_END);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(title_lbl), "account-name");
+    gtk_box_pack_start(GTK_BOX(vbox), title_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *meta = gtk_label_new(NULL);
+    char *dpath = display_path(s->decoded_path);
+    char *rel = format_relative_time((long)s->last_modified * 1000);
+    char *markup = g_strdup_printf(
+        "<span size=\"small\" foreground=\"#86868b\">%s · %s</span>",
+        dpath, rel);
+    gtk_label_set_markup(GTK_LABEL(meta), markup);
+    g_free(markup); g_free(dpath); g_free(rel);
+    gtk_widget_set_halign(meta, GTK_ALIGN_START);
+    gtk_label_set_ellipsize(GTK_LABEL(meta), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(meta), "account-meta");
+    gtk_box_pack_start(GTK_BOX(vbox), meta, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(hbox), vbox, TRUE, TRUE, 0);
+
+    GtkWidget *resume_btn = gtk_button_new_with_label("Resume");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(resume_btn), "open-button");
+    g_signal_connect(resume_btn, "clicked",
+        G_CALLBACK(on_claude_resume_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), resume_btn, FALSE, FALSE, 0);
+
+    GtkWidget *open_dir_btn = gtk_button_new_with_label("Open Dir");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(open_dir_btn), "edit-button");
+    g_signal_connect(open_dir_btn, "clicked",
+        G_CALLBACK(on_claude_open_dir_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), open_dir_btn, FALSE, FALSE, 0);
+
+    GtkWidget *del_btn = gtk_button_new_with_label("Delete");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(del_btn), "delete-button");
+    g_signal_connect(del_btn, "clicked",
+        G_CALLBACK(on_claude_delete_clicked), s);
+    gtk_box_pack_start(GTK_BOX(hbox), del_btn, FALSE, FALSE, 0);
+
+    return hbox;
+}
+
+static void
+on_claude_search_changed(GtkSearchEntry *entry, gpointer data)
+{
+    (void)entry; (void)data;
+    refresh_claude_list();
+}
+
+static void
+refresh_claude_list(void)
+{
+    if (g_claude_list_box == NULL) return;
+
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(g_claude_list_box));
+    for (GList *l = kids; l != NULL; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    const char *search = g_claude_search
+        ? gtk_entry_get_text(GTK_ENTRY(g_claude_search)) : NULL;
+    GPtrArray *sessions = claude_load_sessions(search);
+
+    if (g_claude_count_lbl) {
+        char *count_text = g_strdup_printf("%d sessions", sessions->len);
+        gtk_label_set_text(GTK_LABEL(g_claude_count_lbl), count_text);
+        g_free(count_text);
+    }
+
+    if (sessions->len == 0) {
+        GtkWidget *row = gtk_list_box_row_new();
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+        GtkWidget *empty = gtk_label_new("No Claude sessions indexed.\n"
+            "Start a Claude session to populate the index.");
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(empty), "empty-label");
+        gtk_container_add(GTK_CONTAINER(row), empty);
+        gtk_container_add(GTK_CONTAINER(g_claude_list_box), row);
+    } else {
+        for (guint i = 0; i < sessions->len; i++) {
+            ClaudeSession *s = g_ptr_array_index(sessions, i);
+            g_ptr_array_index(sessions, i) = NULL;
+            GtkWidget *r = gtk_list_box_row_new();
+            gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(r), FALSE);
+            gtk_container_add(GTK_CONTAINER(r), create_claude_row(s));
+            gtk_container_add(GTK_CONTAINER(g_claude_list_box), r);
+            g_object_set_data_full(G_OBJECT(r), "session",
+                s, (GDestroyNotify)claude_session_free);
+        }
+    }
+    g_ptr_array_free(sessions, TRUE);
+    gtk_widget_show_all(g_claude_list_box);
+}
+
+static void
+on_claude_rescan_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn; (void)data;
+    claude_scan_all_projects();
+    refresh_claude_list();
+    set_status("✓ Re-scanned ~/.claude/projects/");
+}
+
+static GtkWidget *
+build_claude_tab(void)
+{
+    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    /* Header */
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(header), "header-box");
+    gtk_box_pack_start(GTK_BOX(root), header, FALSE, FALSE, 0);
+
+    GtkWidget *header_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_hexpand(header_text, TRUE);
+
+    GtkWidget *title = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(title),
+        "<span font_weight=\"bold\" size=\"12000\">"
+        "Claude Sessions</span>");
+    gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(title), "title-label");
+    gtk_box_pack_start(GTK_BOX(header_text), title, FALSE, FALSE, 0);
+
+    GtkWidget *subtitle = gtk_label_new(
+        "Indexed CLI sessions from ~/.claude/projects/");
+    gtk_widget_set_halign(subtitle, GTK_ALIGN_START);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(subtitle), "subtitle-label");
+    gtk_box_pack_start(GTK_BOX(header_text), subtitle, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(header), header_text, TRUE, TRUE, 0);
+
+    g_claude_count_lbl = gtk_label_new("");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(g_claude_count_lbl), "subtitle-label");
+    gtk_box_pack_end(GTK_BOX(header), g_claude_count_lbl, FALSE, FALSE, 0);
+
+    GtkWidget *rescan_btn = gtk_button_new_with_label("Rescan");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(rescan_btn), "edit-button");
+    g_signal_connect(rescan_btn, "clicked",
+        G_CALLBACK(on_claude_rescan_clicked), NULL);
+    gtk_box_pack_end(GTK_BOX(header), rescan_btn, FALSE, FALSE, 0);
+
+    /* Search */
+    GtkWidget *search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_margin_start(search_bar,   12);
+    gtk_widget_set_margin_end(search_bar,     12);
+    gtk_widget_set_margin_top(search_bar,      8);
+    gtk_widget_set_margin_bottom(search_bar,   8);
+    g_claude_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(g_claude_search),
+        "Search by title, message, or directory...");
+    gtk_widget_set_hexpand(g_claude_search, TRUE);
+    g_signal_connect(g_claude_search, "search-changed",
+        G_CALLBACK(on_claude_search_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(search_bar), g_claude_search, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), search_bar, FALSE, FALSE, 0);
+
+    /* Scrolled list */
+    GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                    GTK_POLICY_NEVER,
+                                    GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
+
+    g_claude_list_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_claude_list_box),
+                                     GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(scrolled), g_claude_list_box);
+
+    claude_index_db_init();
+    claude_scan_all_projects();
+    refresh_claude_list();
     return root;
 }
 
@@ -3286,6 +3951,10 @@ main(int argc, char *argv[])
     GtkWidget *tab_opencode = build_opencode_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_opencode,
         gtk_label_new("OpenCode"));
+
+    GtkWidget *tab_claude = build_claude_tab();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab_claude,
+        gtk_label_new("Claude"));
 
     GtkWidget *tab1 = build_config_opener_tab();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), tab1,
