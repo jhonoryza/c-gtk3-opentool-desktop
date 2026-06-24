@@ -1,172 +1,134 @@
-# Config Opener - Sublime Text Launcher
+# Opentool Desktop
 
-Aplikasi desktop ringan berbasis **C murni** dan **GTK3** untuk macOS yang menampilkan daftar file konfigurasi dan membukanya dengan Sublime Text.
+A GTK3 desktop application (pure C, C11) for Linux that manages CLI sessions, terminals, and developer tools from one unified interface. Ported from the macOS-native `platform-ai` (Swift/SwiftUI) to C/GTK3.
 
-![Platform](https://img.shields.io/badge/platform-macOS%2013%20Ventura-blue)
-![Language](https://img.shields.io/badge/language-C99-orange)
+![Platform](https://img.shields.io/badge/platform-Linux-blue)
+![Language](https://img.shields.io/badge/language-C11-orange)
 ![GTK](https://img.shields.io/badge/GTK-3-green)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-## 📋 Daftar Isi
+## Features (12 tabs)
 
-- [Fitur](#fitur)
-- [Persyaratan](#persyaratan)
-- [Instalasi](#instalasi)
-  - [1. Install GTK3 + pkg-config](#1-install-gtk3--pkg-config)
-  - [2. Install Sublime Text CLI](#2-install-sublime-text-cli)
-  - [3. Clone & Compile](#3-clone--compile)
-- [Penggunaan](#penggunaan)
-- [Struktur Proyek](#struktur-proyek)
-- [Teknis](#teknis)
-- [License](#license)
+| Tab | Description |
+|-----|-------------|
+| **Home** | Dashboard with shortcut grid and keyboard shortcuts reference |
+| **OpenCode** | Session manager reading `~/.local/share/opencode/opencode.db` |
+| **Claude** | JSONL indexer for `~/.claude/projects/` with SQLite cache |
+| **SSH** | Connection CRUD + import from `~/.ssh/config`, grouped display |
+| **Terminal** | Embedded PTY terminal using libvte with quick-launch for tools |
+| **Chat Web** | Embedded webkit2gtk browser for AI chat providers |
+| **Kimchi** | Session indexer for `~/.local/share/kimchi/projects/` |
+| **Mimo** | Shell wrapper running `mimo session list --format json` |
+| **Freebuff** | Directory scanner for `~/.config/manicode/projects/` |
+| **Port Monitor** | Parses `ss -tlnp` output for active TCP listening ports |
+| **Config Opener** | Manage config file shortcuts, open with `$EDITOR` |
+| **Claude Switcher** | Manage multiple Claude API accounts (settings.json writer) |
 
-## ✨ Fitur
+### Command Palette
+Press `Ctrl+P` for fuzzy search navigation across all tabs.
 
-- Menampilkan 7 file konfigurasi umum dalam grid 2 kolom
-- Tombol **"Open with Sublime Text"** untuk setiap file
-- Scrolled window untuk daftar yang panjang
-- Validasi: error jika `subl` tidak ditemukan, warning jika file belum ada
-- Path dengan spasi di-handle dengan benar (`fork()` + `execlp()`)
-- Ekspansi `~` ke home directory
-- Path dinamis untuk user-specific config menggunakan `$USER`
+## Keyboard Shortcuts
 
-### Daftar File Konfigurasi
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+P` | Command Palette |
+| `Ctrl+K` | Go to Home |
+| `Ctrl+W` | Close window |
+| `Ctrl+Q` | Quit application |
 
-| Nama Config | Path |
-|-------------|------|
-| opencode | `~/.config/opencode/opencode.jsonc` |
-| gowails chatai | `/Users/$USER/Library/Application Support/gowails-chatai-desktop/settings.json` |
-| zshrc pre | `~/.zshrc.pre-oh-my-zsh` |
-| zshrc | `~/.zshrc` |
-| tmux | `~/.tmux.conf` |
-| ghossty | `~/.config/ghostty/config` |
-| zed | `~/.config/zed/settings.json` |
+## Requirements
 
-## 📦 Persyaratan
-
-- **macOS 13 Ventura** atau lebih baru
-- **GCC** (Apple Clang bawaan Xcode sudah cukup)
-- **GTK3** (`gtk±3.0`)
+- **Linux** (tested on Ubuntu/Debian)
+- **GCC** with C11 support
+- **GTK3** (`libgtk-3-dev`)
+- **SQLite3** (`libsqlite3-dev`)
+- **VTE** terminal library (`libvte-2.91-dev`)
+- **WebKitGTK** (`libwebkit2gtk-4.1-dev` or `libwebkit2gtk-4.0-dev`)
 - **pkg-config**
-- **Sublime Text** dengan CLI `subl` di PATH
 
-## 🔧 Instalasi
-
-### 1. Install GTK3 + pkg-config
+### Install dependencies (Debian/Ubuntu)
 
 ```bash
-brew install gtk+3 pkg-config
+sudo apt install build-essential pkg-config \
+    libgtk-3-dev libsqlite3-dev \
+    libvte-2.91-dev libwebkit2gtk-4.1-dev
 ```
 
-Verifikasi instalasi:
+### Install dependencies (Arch Linux)
 
 ```bash
-pkg-config --cflags --libs gtk+-3.0
+sudo pacman -S base-devel pkgconf \
+    gtk3 sqlite vte webkitgtk
 ```
 
-### 2. Install Sublime Text CLI
-
-Pastikan Sublime Text sudah terinstall, lalu buat symlink:
+## Build & Run
 
 ```bash
-ln -s /Applications/Sublime\ Text.app/Contents/SharedSupport/bin/subl /usr/local/bin/subl
+make check-deps  # verify dependencies
+make             # build
+make run         # build and run
+make debug       # build with debug symbols (-g -O0)
+make clean       # remove build artifacts
+make install     # install to /usr/local (or PREFIX=...)
+make uninstall   # remove installed files
 ```
 
-Verifikasi:
+## Installation
 
 ```bash
-subl --version
+make && sudo make install
 ```
 
-### 3. Clone & Compile
+This installs:
+- Binary: `/usr/local/bin/opentool`
+- Icon: `/usr/local/share/opentool/logo-512.png`
 
-```bash
-# Clone repositori
-git clone https://github.com/username/config-opener.git
-cd config-opener
-
-# Compile dengan Make
-make
-
-# Atau compile manual
-gcc -std=c99 -Wall -Wextra -o config-opener main.c $(pkg-config --cflags --libs gtk+-3.0)
-```
-
-### 4. Install sebagai macOS App (Optional)
-
-Untuk bisa membuka dari Spotlight (Cmd+Space):
-
-```bash
-# Install ke /Applications
-make install-app
-
-# Uninstall
-make uninstall-app
-```
-
-## 🚀 Penggunaan
-
-### CLI Mode
-```bash
-# Jalankan aplikasi
-make run
-
-# Atau langsung
-./config-opener
-```
-
-### macOS App (Spotlight)
-```bash
-# Install sebagai macOS app (bisa dibuka dari Spotlight)
-make install-app
-
-# Atau gunakan script installer
-./install.sh
-
-# Uninstall
-make uninstall-app
-# atau
-./uninstall.sh
-```
-
-Setelah install, buka Spotlight (Cmd+Space) dan cari "Config Opener".
-
-## 📁 Struktur Proyek
+## Project Structure
 
 ```
-config-opener/
-├── main.c           # Kode utama aplikasi
-├── Makefile         # Build system
-├── Info.plist       # macOS app bundle metadata
-├── install.sh       # Installer script
-├── uninstall.sh     # Uninstaller script
-├── README.md        # Dokumentasi (file ini)
-└── LICENSE          # Lisensi MIT
+opentool-desktop/
+├── main.c           # All application code (single file, ~5000 lines)
+├── Makefile         # Build system with dependency detection
+├── Info.plist       # (legacy, ignored on Linux)
+├── logo-512.png     # Application icon
+├── README.md        # This file
+└── LICENSE          # MIT License
 ```
 
-## ⚙️ Teknis
+## Technical Details
 
-| Aspek | Detail |
-|-------|--------|
-| Bahasa | C99 / C11 murni (tanpa C++) |
-| GUI Toolkit | GTK 3.24+ (bukan GTK4) |
-| UI Builder | Programmatic (tanpa Glade/XML) |
-| Proses | `fork()` + `execlp()` |
-| Window | 500×300, title "Config Opener - Sublime Text Launcher" |
-| Widget | `GtkWindow` → `GtkBox` → `GtkScrolledWindow` → `GtkGrid` |
-| Error Handling | Dialog `gtk_message_dialog_new` untuk subl not found & fork failure |
-| File Warning | Dialog warning jika file tidak ada (tetap boleh open) |
-| Zombie Reaping | `signal(SIGCHLD, SIG_IGN)` |
+| Aspect | Detail |
+|--------|--------|
+| Language | C11 |
+| GUI Toolkit | GTK 3.24+ |
+| Terminal | libvte-2.91 (VteTerminal) |
+| Web View | webkit2gtk-4.1 |
+| Database | SQLite3 (4 separate DBs) |
+| UI Builder | Programmatic (no Glade/XML) |
+| Processes | `fork()` + `execlp()`, `g_spawn_command_line_sync()` |
+| Theme | Custom CSS with light/dark mode toggle |
+| Data Dir | `$XDG_DATA_HOME/opentool/` (fallback `~/.local/share/opentool/`) |
 
-### Path dengan Spasi
+### Database Files
 
-`execlp()` mengirim argumen sebagai elemen `argv` terpisah — tidak melalui shell. Path seperti `/Users/user/Library/Application Support/...` yang mengandung spasi akan tetap dianggap sebagai satu argumen oleh Sublime Text, tanpa perlu quoting manual.
+| Database | Location | Purpose |
+|----------|----------|---------|
+| `accounts.db` | `$XDG_DATA_HOME/opentool/` | Claude switcher accounts + plugins |
+| `claude_index.db` | `$XDG_DATA_HOME/opentool/` | Indexed Claude JSONL sessions |
+| `ssh.db` | `$XDG_DATA_HOME/opentool/` | SSH connection records |
+| `chat_providers.db` | `$XDG_DATA_HOME/opentool/` | AI chat web providers |
 
-### Ekspansi Path
+### External Paths Read
 
-- `~` diekspansi menggunakan `g_get_home_dir()` (membaca `$HOME` atau fallback ke `/etc/passwd`)
-- Path user-specific menggunakan `g_get_user_name()` (membaca `$USER` atau fallback ke `/etc/passwd`)
+| Path | Feature |
+|------|---------|
+| `~/.local/share/opencode/opencode.db` | OpenCode session list |
+| `~/.claude/projects/` | Claude JSONL scan |
+| `~/.claude/settings.json` | Claude Switcher (write) |
+| `~/.ssh/config` | SSH import |
+| `~/.local/share/kimchi/projects/` | Kimchi JSONL scan |
+| `~/.config/manicode/projects/` | Freebuff directory scan |
 
-## 📄 License
+## License
 
-Proyek ini dilisensikan di bawah **MIT License** — lihat file [LICENSE](LICENSE) untuk detail.
+MIT License - see [LICENSE](LICENSE) for details.
