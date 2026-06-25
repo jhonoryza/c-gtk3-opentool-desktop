@@ -11,7 +11,9 @@
  *       $(pkg-config --cflags --libs gtk+-3.0 sqlite3 vte-2.91 webkit2gtk-4.1)
  */
 
+#define _GNU_SOURCE
 #include <gtk/gtk.h>
+#include <glib/gstdio.h>
 #include <sqlite3.h>
 #include <vte/vte.h>
 #include <webkit2/webkit2.h>
@@ -27,6 +29,12 @@
 #include <time.h>
 #include <dirent.h>
 #include <fcntl.h>
+
+/* ────────────────────────────────────────────────────────────────────────
+ *  Forward declarations
+ * ──────────────────────────────────────────────────────────────────────── */
+
+static void palette_show(void);
 
 /* ────────────────────────────────────────────────────────────────────────
  *  Domain types
@@ -2409,8 +2417,8 @@ claude_index_file(const char *filepath)
     }
     g_free(data);
 
-    GStatBuf st;
-    if (g_stat(filepath, &st) != 0) {
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
         g_free(proj_dir_name);
         g_free(session_id);
         return;
@@ -4070,7 +4078,7 @@ build_chat_web_tab(void)
     g_chat_webview_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     g_webview = WEBKIT_WEB_VIEW(webkit_web_view_new());
     WebKitSettings *settings = webkit_web_view_get_settings(g_webview);
-    webkit_settings_set_javascript_enabled(settings, TRUE);
+    webkit_settings_set_enable_javascript(settings, TRUE);
     webkit_settings_set_allow_file_access_from_file_urls(settings, TRUE);
     webkit_settings_set_enable_developer_extras(settings, TRUE);
 
@@ -4145,8 +4153,8 @@ kimchi_scan_and_index(GPtrArray *arr)
         while ((se = readdir(sd)) != NULL) {
             if (!g_str_has_suffix(se->d_name, ".jsonl")) continue;
             char *fp = g_build_filename(subdir, se->d_name, NULL);
-            GStatBuf st;
-            if (g_stat(fp, &st) != 0) { g_free(fp); continue; }
+            struct stat st;
+            if (stat(fp, &st) != 0) { g_free(fp); continue; }
             char *title = NULL, *msg = NULL;
             claude_parse_jsonl(fp, &title, &msg);
             char *dotless = g_strdup(se->d_name);
