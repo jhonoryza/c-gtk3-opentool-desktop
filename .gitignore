@@ -1,2 +1,5 @@
 opentool
-main.o
+*.o
+*.d
+.clangd
+compile_commands.json

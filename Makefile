@@ -1,5 +1,6 @@
 # Makefile — Opentool Desktop
 # Linux GTK3 C application with terminal emulation and web views
+# Requires: Ubuntu 22.04+ (glibc 2.35+)
 
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2
@@ -10,7 +11,11 @@ TARGET  := opentool
 SRCS    := main.c
 OBJS    := main.o
 
-.PHONY: all run clean install uninstall clangd clean-clangd check-deps help debug
+# Minimum glibc: 2.35 (Ubuntu 22.04)
+MIN_GLIBC_MAJOR := 2
+MIN_GLIBC_MINOR := 35
+
+.PHONY: all run clean install uninstall clangd clean-clangd check-deps check-glibc help debug
 
 all: $(TARGET)
 
@@ -69,7 +74,7 @@ debug: clean all
 
 # ── Dependency check ──
 
-check-deps:
+check-deps: check-glibc
 	@echo "Checking dependencies..."
 	@pkg-config --exists gtk+-3.0 || { \
 		echo "ERROR: GTK3 not found. Install: sudo apt install libgtk-3-dev"; \
@@ -93,6 +98,23 @@ check-deps:
 	@echo "  webkit2gtk"
 	@echo "  compiler: $(CC)"
 	@echo "All dependencies satisfied."
+
+# ── glibc version check (minimum 2.35 = Ubuntu 22.04) ──
+
+check-glibc:
+	@GLIBC_VER=$$(ldd --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+$$'); \
+	if [ -z "$$GLIBC_VER" ]; then \
+		echo "WARNING: Could not detect glibc version."; \
+	else \
+		MAJOR=$$(echo "$$GLIBC_VER" | cut -d. -f1); \
+		MINOR=$$(echo "$$GLIBC_VER" | cut -d. -f2); \
+		if [ "$$MAJOR" -lt $(MIN_GLIBC_MAJOR) ] || \
+		   { [ "$$MAJOR" -eq $(MIN_GLIBC_MAJOR) ] && [ "$$MINOR" -lt $(MIN_GLIBC_MINOR) ]; }; then \
+			echo "ERROR: glibc $$GLIBC_VER detected. Minimum required: $(MIN_GLIBC_MAJOR).$(MIN_GLIBC_MINOR) (Ubuntu 22.04+)"; \
+			exit 1; \
+		fi; \
+		echo "  glibc $$GLIBC_VER >= $(MIN_GLIBC_MAJOR).$(MIN_GLIBC_MINOR) ✓"; \
+	fi
 
 # ── Help ──
 
