@@ -3488,7 +3488,7 @@ term_launch(TermSession *ts, const char *command, const char *cwd)
         VTE_PTY_DEFAULT,
         cwd ? cwd : g_get_home_dir(),
         g_file_test("/bin/bash", G_FILE_TEST_IS_EXECUTABLE) ? argv : fallback_argv,
-        NULL, 0,
+        NULL,
         G_SPAWN_DEFAULT,
         NULL, NULL, NULL,
         -1, NULL, NULL, NULL);
